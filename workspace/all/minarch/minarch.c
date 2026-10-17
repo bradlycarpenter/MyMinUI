@@ -1218,8 +1218,8 @@ static char* overclock_labels[] = {
 
 // TODO: this should be provided by the core
 static char* gamepad_labels[] = {
-	"Standard",
-	"DualShock",
+	"Standard (D-pad only)",
+	"DualShock (analog)",
 	NULL,
 };
 static char* gamepad_values[] = {
@@ -4274,7 +4274,7 @@ static int OptionControls_openMenu(MenuList* list, int i) {
 		if (has_custom_controllers) {
 			MenuItem* item = &OptionControls_menu.items[k++];
 			item->name = "Controller";
-			item->desc = "Select the type of controller.";
+			item->desc = "Select the type of controller.\nDualShock enables the analog sticks;\nL1+R1+Select toggles analog in game.";
 			item->value = gamepad_type;
 			item->values = gamepad_labels;
 			item->on_change = OptionControls_optionChanged;
