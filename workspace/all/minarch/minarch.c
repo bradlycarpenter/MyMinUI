@@ -22,6 +22,8 @@
 #include "api.h"
 
 #include <sys/sysinfo.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 
 #if defined(USE_SDL2)
@@ -402,6 +404,111 @@ static void Game_open(char* path) {
 	
 	game.is_open = 1;
 }
+
+// Disc images are read from the SD card on demand, so a seek into an uncached region
+// stalls the emulator thread for tens of ms. Reading the image once in the background
+// puts it in the page cache, which (unlike the core's whole-disc precache) the kernel
+// can still reclaim under memory pressure.
+static int prewarm_enabled = 1;
+static volatile int prewarm_running = 0;
+#define PREWARM_CHUNK (256 * 1024)
+#define PREWARM_MAX_FILES 8
+#define PREWARM_HEADROOM_KB (150 * 1024)
+
+static long prewarmAvailableKB(void) {
+	char line[128];
+	long kb = 0;
+	FILE* f = fopen("/proc/meminfo", "r");
+	if (!f) return 0;
+	while (fgets(line, sizeof(line), f)) {
+		if (sscanf(line, "MemAvailable: %ld kB", &kb) == 1) break;
+	}
+	fclose(f);
+	return kb;
+}
+
+static int prewarmHasDiscExtension(const char* path) {
+	const char* exts[] = {".bin", ".img", ".iso", ".chd", ".pbp", NULL};
+	for (int i = 0; exts[i]; i++) {
+		if (suffixMatch((char*)exts[i], (char*)path)) return 1;
+	}
+	return 0;
+}
+
+static int prewarmCollect(char files[PREWARM_MAX_FILES][MAX_PATH]) {
+	int count = 0;
+	if (suffixMatch(".cue", (char*)game.path)) {
+		char dir[MAX_PATH];
+		strcpy(dir, game.path);
+		char* slash = strrchr(dir, '/');
+		if (!slash) return 0;
+		slash[1] = '\0';
+		FILE* cue = fopen(game.path, "r");
+		if (!cue) return 0;
+		char line[MAX_PATH];
+		while (count < PREWARM_MAX_FILES && fgets(line, sizeof(line), cue)) {
+			char* start = strstr(line, "FILE \"");
+			if (!start) continue;
+			start += 6;
+			char* end = strchr(start, '"');
+			if (!end) continue;
+			*end = '\0';
+			snprintf(files[count++], MAX_PATH, "%s%s", dir, start);
+		}
+		fclose(cue);
+	}
+	else if (prewarmHasDiscExtension(game.path)) {
+		snprintf(files[count++], MAX_PATH, "%s", game.path);
+	}
+	return count;
+}
+
+static void* prewarmThread(void* arg) {
+	char files[PREWARM_MAX_FILES][MAX_PATH];
+	int count = prewarmCollect(files);
+	long long total = 0;
+	struct stat st;
+	for (int i = 0; i < count; i++) {
+		if (stat(files[i], &st) == 0) total += st.st_size;
+	}
+	long available_kb = prewarmAvailableKB();
+	if (!count || total / 1024 + PREWARM_HEADROOM_KB > available_kb) {
+		LOG_info("[PREWARM] skipped: %i files, %lld MB, %ld MB available\n", count, total >> 20, available_kb >> 10);
+		prewarm_running = 0;
+		return NULL;
+	}
+	setpriority(PRIO_PROCESS, syscall(SYS_gettid), 19);
+	LOG_info("[PREWARM] caching %i files, %lld MB\n", count, total >> 20);
+	char* buf = malloc(PREWARM_CHUNK);
+	uint32_t started = MY_GetTicks();
+	struct timespec pause = {0, 4000000};
+	for (int i = 0; buf && i < count && prewarm_enabled && !quit; i++) {
+		int fd = open(files[i], O_RDONLY);
+		if (fd < 0) continue;
+		off_t offset = 0;
+		ssize_t n;
+		while (prewarm_enabled && !quit && (n = pread(fd, buf, PREWARM_CHUNK, offset)) > 0) {
+			offset += n;
+			// pause while the core is stopped (menu, sleep) so the card can idle
+			while (prewarm_enabled && !quit && thread_video && !should_run_core) usleep(100000);
+			nanosleep(&pause, NULL);
+		}
+		close(fd);
+	}
+	free(buf);
+	LOG_info("[PREWARM] done in %ums\n", MY_GetTicks() - started);
+	prewarm_running = 0;
+	return NULL;
+}
+
+static void Prewarm_start(void) {
+	if (!prewarm_enabled || prewarm_running) return;
+	prewarm_running = 1;
+	pthread_t t;
+	if (pthread_create(&t, NULL, prewarmThread, NULL) == 0) pthread_detach(t);
+	else prewarm_running = 0;
+}
+
 static void Game_close(void) {
 	if (game.data) free(game.data);
 	if (game.tmp_path[0]) remove(game.tmp_path);
@@ -1082,6 +1189,7 @@ enum {
 	FE_OPT_MAXFF,
 	FE_OPT_PLAYAS,
 	FE_OPT_RUMBLE,
+	FE_OPT_PREWARM,
 	FE_OPT_COUNT,
 };
 
@@ -1361,6 +1469,16 @@ static struct Config {
 				.values = rumble_labels,
 				.labels = rumble_labels,
 			},
+			[FE_OPT_PREWARM] = {
+				.key	= "minarch_cache_disc",
+				.name	= "Cache Disc in RAM",
+				.desc	= "Read CD images into spare memory\nin the background to avoid hitches\nwhen the game loads from disc.",
+				.default_value = 1,
+				.value = 1,
+				.count = 2,
+				.values = onoff_labels,
+				.labels = onoff_labels,
+			},
 			[FE_OPT_COUNT] = {NULL}
 		}
 	},
@@ -1484,6 +1602,11 @@ static void Config_syncFrontend(char* key, int value) {
 	else if (exactMatch(key,config.frontend.options[FE_OPT_MAXFF].key)) {
 		max_ff_speed = value;
 		i = FE_OPT_MAXFF;
+	}
+	else if (exactMatch(key,config.frontend.options[FE_OPT_PREWARM].key)) {
+		prewarm_enabled = value;
+		if (prewarm_enabled && game.is_open) Prewarm_start();
+		i = FE_OPT_PREWARM;
 	}
 	else if (exactMatch(key,config.frontend.options[FE_OPT_RUMBLE].key)) {
 		rumble_scale_pct = value * 25;
@@ -5869,6 +5992,7 @@ int main(int argc , char* argv[]) {
 		
 	SND_init(core.sample_rate, core.fps);
 	InitSettings(); // after we initialize audio
+	Prewarm_start();
 	Menu_init();
 	State_resume(resume_slot);
 	resume_slot=-1;

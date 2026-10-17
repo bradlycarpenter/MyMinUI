@@ -39,7 +39,14 @@ if [ -n "$SD_DEV" ] && [ -d "$SD_QUEUE" ]; then
 	grep -q deadline "$SD_QUEUE/scheduler" && SCHED=deadline
 	sudo sh -c "echo $SCHED > $SD_QUEUE/scheduler; echo 128 > $SD_QUEUE/read_ahead_kb"
 	echo "after: scheduler=$(cat $SD_QUEUE/scheduler) read_ahead_kb=$(cat $SD_QUEUE/read_ahead_kb)" >> "$IO_LOG"
+	# runtime PM suspends the card after a few idle seconds and resuming it costs a
+	# read; keep it awake while a disc game runs and restore the setting afterwards
+	SD_PM=/sys/block/$SD_DEV/device/power/control
+	SD_PM_WAS=$(cat "$SD_PM" 2>/dev/null)
+	[ -n "$SD_PM_WAS" ] && sudo sh -c "echo on > $SD_PM"
+	echo "runtime pm: $SD_PM_WAS -> $(cat $SD_PM 2>/dev/null)" >> "$IO_LOG"
 fi
 launch_rom.sh  "$1" "$2" "$3" "$4" ${RUN} ${RUN2} "$CURDIR" "$EMU_EXE" $CPU_OC
+[ -n "$SD_PM_WAS" ] && sudo sh -c "echo $SD_PM_WAS > $SD_PM"
 overclock.elf ${CPU_SPEED_MENU}
 
