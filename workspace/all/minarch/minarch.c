@@ -409,7 +409,7 @@ static void Game_open(char* path) {
 // stalls the emulator thread for tens of ms. Reading the image once in the background
 // puts it in the page cache, which (unlike the core's whole-disc precache) the kernel
 // can still reclaim under memory pressure.
-static int prewarm_enabled = 1;
+static int prewarm_enabled = 0;
 static volatile int prewarm_running = 0;
 #define PREWARM_CHUNK (256 * 1024)
 #define PREWARM_MAX_FILES 8
@@ -1473,8 +1473,8 @@ static struct Config {
 				.key	= "minarch_cache_disc",
 				.name	= "Cache Disc in RAM",
 				.desc	= "Read CD images into spare memory\nin the background to avoid hitches\nwhen the game loads from disc.",
-				.default_value = 1,
-				.value = 1,
+				.default_value = 0,
+				.value = 0,
 				.count = 2,
 				.values = onoff_labels,
 				.labels = onoff_labels,
