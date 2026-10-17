@@ -238,6 +238,7 @@ LID_Context lid = {
 #define FALLBACK_IMPLEMENTATION __attribute__((weak)) // used if platform doesn't provide an implementation
 FALLBACK_IMPLEMENTATION void PLAT_initLid(void) {  }
 FALLBACK_IMPLEMENTATION int PLAT_lidChanged(int* state) { return 0; }
+FALLBACK_IMPLEMENTATION int PLAT_hasHardwareVsync(void) { return 0; }
 
 ///////////////////////////////
 
@@ -362,7 +363,9 @@ void GFX_sync(void) {
 }
 
 void GFX_flip(SDL_Surface* screen) {
-	int should_vsync = (gfx.vsync!=VSYNC_OFF && (gfx.vsync==VSYNC_STRICT || frame_start==0 || MY_GetTicks()-frame_start<FRAME_BUDGET));
+	// with a hardware vsync the flip thread is what paces the threaded core, so the
+	// lenient budget check (timed from the main thread) must not skip the wait
+	int should_vsync = (gfx.vsync!=VSYNC_OFF && (gfx.vsync==VSYNC_STRICT || PLAT_hasHardwareVsync() || frame_start==0 || MY_GetTicks()-frame_start<FRAME_BUDGET));
 	PLAT_flip(screen, should_vsync);
 }
 
@@ -1018,6 +1021,11 @@ static inline SND_Frame process_sinc_neon_aligned(int phase_idx) {
 	return out;
 }
 
+double snd_stat_min_latency_ms = 1000.0;
+uint32_t snd_stat_prerolls = 0;
+uint32_t snd_stat_flushes = 0;
+uint32_t snd_stat_max_latency_ms = 0;
+
 size_t SND_batchSamples(const SND_Frame* frames, size_t frame_count) {
 	if (!frames || frame_count == 0) return 0;
 
@@ -1032,6 +1040,8 @@ size_t SND_batchSamples(const SND_Frame* frames, size_t frame_count) {
 	uint32_t queued_bytes = 4608; 
 #endif
 	double current_latency_ms = (double)queued_bytes / 192.0;
+	if (queue_pre_roll_complete && current_latency_ms < snd_stat_min_latency_ms) snd_stat_min_latency_ms = current_latency_ms;
+	if (current_latency_ms > snd_stat_max_latency_ms) snd_stat_max_latency_ms = (uint32_t)current_latency_ms;
 
 	double core_target_fps = (snd.frame_rate > 5.0 && snd.frame_rate <= 125.0) ? snd.frame_rate : 60.0;
 	double target_latency_ms;
@@ -1047,11 +1057,24 @@ size_t SND_batchSamples(const SND_Frame* frames, size_t frame_count) {
 		target_latency_ms = 1440.0 / core_target_fps;
 	}
 
-	if (queue_pre_roll_complete && current_latency_ms < 16.0 && snd.sample_rate_in > 48000) {
+	// the device pulls 512-sample (~10.7ms) chunks, so the queue must sit well above
+	// one chunk or the re-preroll below fires on every pull
+	if (snd.sample_rate_in > 48000 && target_latency_ms < 32.0) target_latency_ms = 32.0;
+
+	if (queue_pre_roll_complete && current_latency_ms < 6.0 && snd.sample_rate_in > 48000) {
+		snd_stat_prerolls++;
 		queue_pre_roll_complete = 0;
 #if defined (USE_SDL2)
 		SDL_PauseAudioDevice(audioDeviceID, 1);
 #endif
+	}
+
+	if (current_latency_ms > 100.0) {
+#if defined (USE_SDL2)
+		SDL_ClearQueuedAudio(audioDeviceID);
+#endif
+		snd_stat_flushes++;
+		current_latency_ms = 0.0;
 	}
 
 	double latency_error_ms = target_latency_ms - current_latency_ms;

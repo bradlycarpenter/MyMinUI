@@ -10,6 +10,12 @@
 #include <signal.h>
 
 #define FIFO_PATH "/tmp/dsp"
+#ifndef F_SETPIPE_SZ
+#define F_SETPIPE_SZ 1031
+#endif
+// the default 64KB pipe holds ~333ms of 48kHz stereo; since the ALSA side is kept
+// at LATENCY_TARGET_MS the pipe sits full and that becomes audible input lag
+#define FIFO_SIZE 8192
 #define BUFFER_SIZE 1024 
 
 #define SAMPLING_FREQ     48000
@@ -78,6 +84,8 @@ int main(int argc, char *argv[]) {
         snd_pcm_close(alsa_handle);
         return 1;
     }
+    int pipe_size = fcntl(fifo_fd, F_SETPIPE_SZ, FIFO_SIZE);
+    printf("[AUDIO SERVER] FIFO size: %d\n", pipe_size);
 
     while (1) {
         // 🎯 THE FIX: Check route only if signaled AND the requested target differs from actual current state

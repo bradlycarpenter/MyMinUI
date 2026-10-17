@@ -44,6 +44,11 @@ static int simple_mode = 0;
 static int thread_video = 0;
 static int should_run_core = 0; // used by threaded video
 static int should_run_flip = 0;
+// threaded handoff: frame_pending is the predicate for flip_rq so a signal sent while
+// the flip thread is busy isn't lost; bb_in_use guards the single backbuffer, which
+// the core may only overwrite once the flip thread has blitted the previous frame
+static int frame_pending = 0;
+static volatile int bb_in_use = 0;
 static int flipThreadStarted = 0;
 static int coreThreadStarted = 0;
 static int flipThreadPaused = 0;
@@ -2055,7 +2060,9 @@ static void wait_For_Thread(void) {
 	render = 0;
 	pthread_mutex_lock(&flip_mx);
 	should_run_flip = 0;
+	frame_pending = 0;
 	pthread_mutex_unlock(&flip_mx);
+	bb_in_use = 0;
 	waiting_for_thread_stop = 0;
 }
 
@@ -2068,7 +2075,15 @@ static int setFastForward(int enable) {
 uint32_t buttons = 0; // RETRO_DEVICE_ID_JOYPAD_* buttons
 int16_t analogs[16] = {0};
 static int ignore_menu = 0;
+extern uint64_t frame_stage_ns[6];
+uint64_t PLAT_nowNs(void);
+static void input_poll_callback_impl(void);
 static void input_poll_callback(void) {
+	uint64_t t0 = PLAT_nowNs();
+	input_poll_callback_impl();
+	frame_stage_ns[0] += PLAT_nowNs() - t0;
+}
+static void input_poll_callback_impl(void) {
 	PAD_poll();
 
 	int show_setting = 0;
@@ -3214,6 +3229,7 @@ static void video_refresh_callback_main(const void *data, unsigned width, unsign
 //	gettimeofday(&now2,NULL);
 //	screengame = PLAT_getScreenGame();
 	GFX_blitRenderer(&renderer);
+	if (thread_video) bb_in_use = 0;
 	//unsigned long long now_usec = 0;
 	//unsigned long long now_usec2 = 0;
 	//gettimeofday(&now3,NULL);	
@@ -3274,7 +3290,9 @@ extern uint64_t global_telemetry_start_perf;
 extern uint32_t global_audio_frame_counter;
 extern uint32_t global_video_frame_counter;
 
+void PLAT_markVideoEntry(void);
 static void video_refresh_callback(const void *data, unsigned width, unsigned height, size_t pitch) {
+	PLAT_markVideoEntry();
 
 //	struct timeval now;
 //	gettimeofday(&now, NULL);
@@ -3313,6 +3331,10 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 //		realloc(backbuffer.pixels, pitch * height);	
 //	}
 
+	if (thread_video) {
+		uint64_t give_up = MY_GetPerformanceCounter() + SDL_GetPerformanceFrequency() / 20;
+		while (bb_in_use && !quit && MY_GetPerformanceCounter() < give_up) usleep(100);
+	}
 	uint16_t *output = backbuffer.pixels;
 	//struct timeval now, now2;
 	//gettimeofday(&now,NULL);
@@ -3355,6 +3377,9 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 	if (thread_video) {		
 		pthread_mutex_lock(&flip_mx);
 		fps2_ticks++;
+		frame_pending = 1;
+		bb_in_use = 1;
+		pthread_cond_signal(&flip_rq);
 		pthread_mutex_unlock(&flip_mx);
 		
 		pthread_mutex_lock(&core_mx);
@@ -3404,7 +3429,14 @@ struct timeval tv;
 static uint64_t last_audio_time = 0;
 static uint64_t microsvalue = 0;
 static uint32_t frame_period_usecs = 0;
-static size_t audio_sample_batch_callback(const int16_t *data, size_t frames) { 
+static size_t audio_sample_batch_callback_impl(const int16_t *data, size_t frames);
+static size_t audio_sample_batch_callback(const int16_t *data, size_t frames) {
+	uint64_t t0 = PLAT_nowNs();
+	size_t r = audio_sample_batch_callback_impl(data, frames);
+	frame_stage_ns[1] += PLAT_nowNs() - t0;
+	return r;
+}
+static size_t audio_sample_batch_callback_impl(const int16_t *data, size_t frames) { 
 	if (fast_forward) return frames;
 	if (waiting_for_thread_stop == 1){
 		return frames;
@@ -5468,6 +5500,8 @@ static double screen_fps = 60.0; // Fallback standard iniziale
 /* Cambiamo il tipo della variabile in uint64_t per ospitare i tick a 64-bit di SDL */
 static uint64_t start_frame_time = 0;
 
+extern volatile uint32_t PLAT_vsyncCounter;
+int PLAT_hasHardwareVsync(void);
 static void limitFF(void) {
 	static uint64_t ff_frame_time = 0;
 	static uint64_t last_time = 0;
@@ -5476,6 +5510,33 @@ static void limitFF(void) {
 	/* 1. SEZIONE VELOCITÀ NOMINALE (GAMEPLAY REALE SENZA FAST-FORWARD) */
 	if (!fast_forward) {
 		double core_fps = (core.fps > 5.0 && core.fps <= 125.0) ? core.fps : 60.0;
+
+		// pacing the core to its nominal fps while the display flips at its own rate
+		// makes the two beat (60.42Hz panel vs 59.73fps GBA = a repeated frame every
+		// ~1.4s); with a real vsync, run one core frame per refresh and let the audio
+		// resampler absorb the small speed difference instead
+		if (prevent_tearing != 0 && PLAT_hasHardwareVsync() && fabs(screen_fps - core_fps) / core_fps < 0.025) {
+			static uint32_t last_vsync = 0;
+			if (thread_video) {
+				// count core runs rather than presented frames: cores may skip the video
+				// callback for duplicate frames, and those runs still produce audio
+				static uint32_t core_runs = 0;
+				static uint32_t vsync_base = 0;
+				core_runs++;
+				uint32_t shown = PLAT_vsyncCounter - vsync_base;
+				// after the menu or sleep the display kept counting; don't let the core sprint to catch up
+				if ((int32_t)(core_runs - shown) < 0) vsync_base = PLAT_vsyncCounter - core_runs;
+				uint64_t give_up = MY_GetPerformanceCounter() + SDL_GetPerformanceFrequency() / 10;
+				while ((int32_t)(core_runs - (PLAT_vsyncCounter - vsync_base)) > 1 && !quit && MY_GetPerformanceCounter() < give_up) usleep(200);
+				last_time = 0;
+				return;
+			}
+			uint64_t give_up = MY_GetPerformanceCounter() + SDL_GetPerformanceFrequency() / 10;
+			while (PLAT_vsyncCounter == last_vsync && !quit && MY_GetPerformanceCounter() < give_up) usleep(200);
+			last_vsync = PLAT_vsyncCounter;
+			last_time = 0;
+			return;
+		}
 
 		/* Se il VSync è attivo, controlliamo se il core è in bolla con lo schermo */
 		if (prevent_tearing != 0) {
@@ -5583,8 +5644,18 @@ static void* flipThread(void *arg) {
 		if (run) {
 			trackFPS();
 			pthread_mutex_lock(&flip_mx);
-			pthread_cond_wait(&flip_rq, &flip_mx);	
-			video_refresh_callback_main(backbuffer.pixels,backbuffer.w,backbuffer.h,backbuffer.pitch);
+			while (!frame_pending && should_run_flip && !quit) {
+				struct timespec until;
+				clock_gettime(CLOCK_REALTIME, &until);
+				until.tv_nsec += 20000000;
+				if (until.tv_nsec >= 1000000000) { until.tv_sec += 1; until.tv_nsec -= 1000000000; }
+				pthread_cond_timedwait(&flip_rq, &flip_mx, &until);
+			}
+			int take = frame_pending;
+			frame_pending = 0;
+			pthread_mutex_unlock(&flip_mx);
+			if (take) video_refresh_callback_main(backbuffer.pixels,backbuffer.w,backbuffer.h,backbuffer.pitch);
+			pthread_mutex_lock(&flip_mx);
 #endif
 			render = 0;
 			pthread_mutex_unlock(&flip_mx);

@@ -23,6 +23,7 @@
 #include "sdl.h"
 #include "sunxi_display2.h"
 #include <time.h>
+#include <pthread.h>
 #include <sys/time.h>
 
 #define ION_IOC_SUNXI_FREE           0xC0044901 
@@ -230,13 +231,36 @@ void PLAT_quitInput(void) {
 	close(rumblefd);
 }
 
+uint64_t frame_stage_ns[6];
+static const char* frame_stage_names[6] = {"input", "audio", "to_video", "blit", "copy", "commit"};
+uint64_t PLAT_nowNs(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
 #define LID_PATH "/sys/class/power_supply/axp2202-battery/hallkey"
+// hallkey is served by the AXP2202 driver over I2C; polling it every frame on the
+// input path adds avoidable latency, so a thread samples it at 10Hz instead
+static volatile int lid_cached_open = 1;
+static void* lid_monitor(void* arg) {
+	while (1) {
+		lid_cached_open = getInt(LID_PATH);
+		usleep(100000);
+	}
+	return NULL;
+}
 void PLAT_initLid(void) {
 	lid.has_lid = exists(LID_PATH);
+	if (lid.has_lid) {
+		lid_cached_open = getInt(LID_PATH);
+		pthread_t lid_thread;
+		if (pthread_create(&lid_thread, NULL, lid_monitor, NULL) == 0) pthread_detach(lid_thread);
+	}
 }
 int PLAT_lidChanged(int* state) {
 	if (lid.has_lid) {
-		int lid_open = getInt(LID_PATH);
+		int lid_open = lid_cached_open;
 		if (lid_open!=lid.is_open) {
 			lid.is_open = lid_open;
 			if (state) *state = lid_open;
@@ -585,11 +609,14 @@ void swap_buffers_init(void){
     pack_gdb_structure(vid.config_w, &vid.config_logica);
 }
 
+uint64_t commit_stage_ns[3];
 int swap_buffers(int page){
 	vid.config_w->dwords[8]=vid.ion_fds[page];
 	uint32_t args[4];
+	uint64_t c0 = PLAT_nowNs();
     args[0] = 0; args[1] = 1; args[2] = 0; args[3] = 0;
     if (ioctl(vid.dispfd, DISP_SHADOW_PROTECT, &args) < 0) return -1;
+	uint64_t c1 = PLAT_nowNs();
 
     args[0] = 0; args[1] = (uint32_t)vid.config_w; args[2] = 1; args[3] = 0;
     if (ioctl(vid.dispfd, DISP_LAYER_SET_CONFIG2, &args) < 0) {
@@ -598,8 +625,13 @@ int swap_buffers(int page){
         return -2;
     }
 
+	uint64_t c2 = PLAT_nowNs();
     args[0] = 0; args[1] = 4; args[2] = 1; args[3] = 0;
     ioctl(vid.dispfd, DISP_HWC_COMMIT, &args);
+	uint64_t c3 = PLAT_nowNs();
+	commit_stage_ns[0] += c1 - c0;
+	commit_stage_ns[1] += c2 - c1;
+	commit_stage_ns[2] += c3 - c2;
 
     args[0] = 0; args[1] = 0; args[2] = 0; args[3] = 0;
     ioctl(vid.dispfd, DISP_SHADOW_PROTECT, &args);
@@ -811,6 +843,8 @@ static uint64_t vsync_last_ns = 0;
 static char vsync_sys_buf[16384];
 
 #define VSYNC_MODE_PATH SHARED_USERDATA_PATH "/vsync-mode"
+#define VSYNC_STATS_PATH SHARED_USERDATA_PATH "/vsync-stats"
+static int vsync_stats_enabled = 0;
 
 static uint64_t vsync_now_ns(void) {
 	struct timespec ts;
@@ -823,8 +857,18 @@ static void vsync_sleep_until(uint64_t ns) {
 	clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
 }
 
+static uint64_t vsync_stat_read_ns = 0;
+static uint32_t vsync_stat_reads = 0;
+static uint64_t vsync_stat_read_max_ns = 0;
+static uint32_t vsync_stat_timeouts = 0;
+
 static uint32_t read_vsync_irq(void) {
+	uint64_t t0 = vsync_now_ns();
 	ssize_t n = pread(vsync_sys_fd, vsync_sys_buf, sizeof(vsync_sys_buf) - 1, 0);
+	uint64_t dt = vsync_now_ns() - t0;
+	vsync_stat_read_ns += dt;
+	vsync_stat_reads++;
+	if (dt > vsync_stat_read_max_ns) vsync_stat_read_max_ns = dt;
 	if (n <= 0) return 0;
 	vsync_sys_buf[n] = '\0';
 	uint32_t irq = 0;
@@ -850,7 +894,8 @@ static void waitVsyncIrq(void) {
 
 	uint64_t deadline = entered + interval + 3000000ULL;
 	struct timespec poll = {0, 100000};
-	while (read_vsync_irq() == start && vsync_now_ns() < deadline) {
+	while (read_vsync_irq() == start) {
+		if (vsync_now_ns() >= deadline) { vsync_stat_timeouts++; break; }
 		nanosleep(&poll, NULL);
 	}
 	vsync_last_ns = vsync_now_ns();
@@ -904,10 +949,94 @@ static void selectVsyncMode(void) {
 	else vsync_wait_mode = VSYNC_WAIT_SOFT;
 
 	vsync_last_ns = 0;
+	vsync_stats_enabled = exists(VSYNC_STATS_PATH);
 	LOG_info("[VSYNC] fbio:%i irq:%i requested:%i -> mode %s\n", fbio_ok, irq_ok, requested, vsync_wait_names[vsync_wait_mode]);
 }
 
+static void waitVsyncMode(void);
+extern double snd_stat_min_latency_ms;
+extern uint32_t snd_stat_prerolls;
+extern uint32_t snd_stat_flushes;
+extern uint32_t snd_stat_max_latency_ms;
+static uint64_t vsync_stat_work_max_ns = 0;
+static uint32_t vsync_stat_late = 0;
+static uint32_t vsync_stat_near = 0;
+static uint64_t vsync_stat_work_ns = 0;
+static uint64_t vsync_stat_prev_ns = 0;
+static uint64_t vsync_stat_window_ns = 0;
+static uint64_t vsync_stat_max_gap_ns = 0;
+static uint32_t vsync_stat_frames = 0;
+static uint32_t vsync_stat_missed = 0;
+
+static void vsyncStats(void) {
+	uint64_t now = vsync_now_ns();
+	if (vsync_stat_prev_ns) {
+		uint64_t gap = now - vsync_stat_prev_ns;
+		if (gap > vsync_stat_max_gap_ns) vsync_stat_max_gap_ns = gap;
+		if (gap > (uint64_t)vsync_ctx.interval_ns * 3 / 2) vsync_stat_missed++;
+	}
+	if (!vsync_stat_window_ns) vsync_stat_window_ns = now;
+	vsync_stat_prev_ns = now;
+	vsync_stat_frames++;
+	if (now - vsync_stat_window_ns >= 5000000000ULL) {
+		if (vsync_stats_enabled) {
+		LOG_info("[VSYNC-STATS] mode:%s frames:%u missed:%u timeouts:%u max_gap:%lluus reads:%u read_avg:%lluus read_max:%lluus audio_min:%.1fms audio_max:%ums flushes:%u prerolls:%u work_max:%lluus work_avg:%lluus near:%u late:%u cpu:%ikHz protect:%lluus setcfg:%lluus hwc:%lluus\n",
+			vsync_wait_names[vsync_wait_mode], vsync_stat_frames, vsync_stat_missed, vsync_stat_timeouts,
+			(unsigned long long)(vsync_stat_max_gap_ns / 1000), vsync_stat_reads,
+			(unsigned long long)(vsync_stat_reads ? vsync_stat_read_ns / vsync_stat_reads / 1000 : 0),
+			(unsigned long long)(vsync_stat_read_max_ns / 1000), snd_stat_min_latency_ms, snd_stat_max_latency_ms, snd_stat_flushes, snd_stat_prerolls,
+			(unsigned long long)(vsync_stat_work_max_ns / 1000),
+			(unsigned long long)(vsync_stat_frames ? vsync_stat_work_ns / vsync_stat_frames / 1000 : 0), vsync_stat_near, vsync_stat_late,
+			getInt("/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq"),
+			(unsigned long long)(vsync_stat_frames ? commit_stage_ns[0] / vsync_stat_frames / 1000 : 0),
+			(unsigned long long)(vsync_stat_frames ? commit_stage_ns[1] / vsync_stat_frames / 1000 : 0),
+			(unsigned long long)(vsync_stat_frames ? commit_stage_ns[2] / vsync_stat_frames / 1000 : 0));
+		memset(commit_stage_ns, 0, sizeof(commit_stage_ns));
+		fflush(stdout);
+		}
+		vsync_stat_window_ns = now;
+		vsync_stat_frames = vsync_stat_missed = vsync_stat_timeouts = vsync_stat_reads = 0;
+		vsync_stat_max_gap_ns = vsync_stat_read_ns = vsync_stat_read_max_ns = 0;
+		snd_stat_min_latency_ms = 1000.0;
+		snd_stat_prerolls = vsync_stat_late = vsync_stat_near = 0;
+		snd_stat_flushes = snd_stat_max_latency_ms = 0;
+		vsync_stat_work_ns = 0;
+		vsync_stat_work_max_ns = 0;
+	}
+}
+
+void PLAT_markVideoEntry(void) {
+	if (vsync_stat_prev_ns) frame_stage_ns[2] = PLAT_nowNs() - vsync_stat_prev_ns;
+}
+
+volatile uint32_t PLAT_vsyncCounter = 0;
+int PLAT_hasHardwareVsync(void) {
+	return vsync_wait_mode != VSYNC_WAIT_SOFT;
+}
+
 void waitVsync(void) {
+	if (vsync_stat_prev_ns) {
+		uint64_t work = vsync_now_ns() - vsync_stat_prev_ns;
+		if (work > vsync_stat_work_max_ns) vsync_stat_work_max_ns = work;
+		if (work > vsync_ctx.interval_ns) {
+			vsync_stat_late++;
+			if (vsync_stats_enabled && vsync_stat_late <= 6) {
+				LOG_info("[LATE] work:%lluus", (unsigned long long)(work / 1000));
+				for (int i = 0; i < 6; i++) printf(" %s:%lluus", frame_stage_names[i], (unsigned long long)(frame_stage_ns[i] / 1000));
+				printf("\n");
+				fflush(stdout);
+			}
+		}
+		if (work > (uint64_t)vsync_ctx.interval_ns * 85 / 100) vsync_stat_near++;
+		vsync_stat_work_ns += work;
+	}
+	waitVsyncMode();
+	PLAT_vsyncCounter++;
+	vsyncStats();
+	memset(frame_stage_ns, 0, sizeof(frame_stage_ns));
+}
+
+static void waitVsyncMode(void) {
 	if (vsync_wait_mode == VSYNC_WAIT_FBIO) {
 		int arg = 0;
 		if (ioctl(vsync_fb_fd, FBIO_WAITFORVSYNC, &arg) == 0) return;
@@ -1162,7 +1291,13 @@ void PLAT_vsync(int remaining) {
 //uint32_t src_w, src_h;
 //struct timespec start_time, mid_time, end_time;
 int quick = 0;
+static void PLAT_blitRendererImpl(GFX_Renderer* renderer);
 void PLAT_blitRenderer(GFX_Renderer* renderer) {
+	uint64_t t0 = PLAT_nowNs();
+	PLAT_blitRendererImpl(renderer);
+	frame_stage_ns[3] += PLAT_nowNs() - t0;
+}
+static void PLAT_blitRendererImpl(GFX_Renderer* renderer) {
 //	src_w=renderer->src_surface->w;
 //    src_h=renderer->src_surface->h;
 //   clock_gettime(CLOCK_MONOTONIC, &start_time);
@@ -1256,6 +1391,7 @@ void *memset32(void *m, uint32_t val, size_t count)
 }
 
 void PLAT_flip(SDL_Surface* IGNORED, int sync) { //this rotates minarch menu + minui + tools
+	uint64_t flip_t0 = PLAT_nowNs();
 	if (!quick) vid.page = (vid.page + 1) % vid.numpages;
 	
 	if (!vid.renderingGame) {
@@ -1316,7 +1452,10 @@ void PLAT_flip(SDL_Surface* IGNORED, int sync) { //this rotates minarch menu + m
 	}
 	vid.renderingGame = 0;	
 	quick = 0;
+	uint64_t flip_t1 = PLAT_nowNs();
+	frame_stage_ns[4] += flip_t1 - flip_t0;
 	swap_buffers(vid.page);	
+	frame_stage_ns[5] += PLAT_nowNs() - flip_t1;
 	if (sync) PLAT_vsync(0);
 	//pan_display(vid.page);
 }
