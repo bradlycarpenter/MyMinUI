@@ -3106,7 +3106,10 @@ void video_refresh_callback_resize(void) {
 	SDL_Rect targetarea = {0,0,GAME_WIDTH,GAME_HEIGHT};
 	switch(screen_scaling) {
 		case SCALE_ASPECT: { 
-							targetarea = video_refresh_callback_resize_custom(0,renderer.src_surface->w, renderer.src_surface->h);
+							// pixel dimensions only match the display aspect for square-pixel
+							// cores; PS1 modes like 368x240 or 640x240 are meant to show at 4:3
+							if (core.aspect_ratio > 0.0) targetarea = video_refresh_callback_resize_custom(0, (int)(core.aspect_ratio * 10000.0), 10000);
+							else targetarea = video_refresh_callback_resize_custom(0,renderer.src_surface->w, renderer.src_surface->h);
 							resizemode = 'A';
 							break;
 							};

@@ -394,7 +394,7 @@ int PLAT_shouldWake(void) {
 }
 
 ///////////////////////////////
-#define NUM_PAGES 2
+#define NUM_PAGES 3
 
 struct VID_Context {
 	//int fdfb; // /dev/fb0 handler
@@ -448,6 +448,7 @@ int init_ion_allocator(void) {
 
         if (ioctl(vid.ionfd, ION_IOC_SUNXI_ALLOC, &alloc_v1) < 0) {
             LOG_info("[ERROR] Failed ION Allocation index %d\n", i);
+            if (i >= 2) break;
             return -2;
         }
         //vid.ion_handles[i] = alloc_v1.handle;
@@ -479,6 +480,8 @@ int init_ion_allocator(void) {
         LOG_info("Success ion alloc fd= %d, size = %u, addr_vir = %p\n", 
                vid.ion_fds[i], vid.screen_size, vid.fbmmap[i]);
     }
+    vid.numpages = i;
+    LOG_info("Video pages: %d\n", vid.numpages);
     return 0;
 }
 
@@ -703,7 +706,7 @@ uint32_t measureAverageVsyncNs(void) {
  * Prima di uscire, incrementa e aggiorna il valore di vsync_ctx.current_irq.
  */
 
-void waitVsync(void) {
+static void waitVsyncSoft(void) {
     struct timespec t_now, t_sleep;
     static struct timespec t_last = {0, 0};
     static struct timespec next_target_time = {0, 0};
@@ -795,7 +798,125 @@ void waitVsync(void) {
     counter++;
 }
 
+enum {
+	VSYNC_WAIT_SOFT,
+	VSYNC_WAIT_IRQ,
+	VSYNC_WAIT_FBIO,
+};
+static const char* vsync_wait_names[] = {"soft", "irq", "fbio"};
+static int vsync_wait_mode = VSYNC_WAIT_SOFT;
+static int vsync_fb_fd = -1;
+static int vsync_sys_fd = -1;
+static uint64_t vsync_last_ns = 0;
+static char vsync_sys_buf[16384];
 
+#define VSYNC_MODE_PATH SHARED_USERDATA_PATH "/vsync-mode"
+
+static uint64_t vsync_now_ns(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static void vsync_sleep_until(uint64_t ns) {
+	struct timespec ts = { .tv_sec = ns / 1000000000ULL, .tv_nsec = ns % 1000000000ULL };
+	clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
+}
+
+static uint32_t read_vsync_irq(void) {
+	ssize_t n = pread(vsync_sys_fd, vsync_sys_buf, sizeof(vsync_sys_buf) - 1, 0);
+	if (n <= 0) return 0;
+	vsync_sys_buf[n] = '\0';
+	uint32_t irq = 0;
+	char* match = strstr(vsync_sys_buf, "irq:");
+	if (match) sscanf(match, "irq:%u", &irq);
+	return irq;
+}
+
+// swap_buffers() commits before we get here, so the wait must be for the next
+// counter increment after entry: that's the vblank which latches the new layer
+static void waitVsyncIrq(void) {
+	uint32_t interval = vsync_ctx.interval_ns;
+	uint64_t entered = vsync_now_ns();
+	uint32_t start = read_vsync_irq();
+
+	if (vsync_last_ns) {
+		uint64_t next = vsync_last_ns + interval;
+		while (next < entered) next += interval;
+		// wake early and poll: sleeping right up to the predicted edge would
+		// regularly overshoot it and cost a whole frame
+		if (next - entered > 2000000ULL) vsync_sleep_until(next - 1500000ULL);
+	}
+
+	uint64_t deadline = entered + interval + 3000000ULL;
+	struct timespec poll = {0, 100000};
+	while (read_vsync_irq() == start && vsync_now_ns() < deadline) {
+		nanosleep(&poll, NULL);
+	}
+	vsync_last_ns = vsync_now_ns();
+}
+
+static int readVsyncModeOverride(void) {
+	char mode[16] = {0};
+	FILE* f = fopen(VSYNC_MODE_PATH, "r");
+	if (!f) return -1;
+	if (!fgets(mode, sizeof(mode), f)) mode[0] = '\0';
+	fclose(f);
+	for (int i = 0; i < 3; i++) {
+		if (prefixMatch((char*)vsync_wait_names[i], mode)) return i;
+	}
+	return -1;
+}
+
+static int probeFbioVsync(void) {
+	if (vsync_fb_fd < 0) return 0;
+	int arg = 0;
+	if (ioctl(vsync_fb_fd, FBIO_WAITFORVSYNC, &arg) < 0) return 0;
+	uint64_t t0 = vsync_now_ns();
+	for (int i = 0; i < 5; i++) {
+		if (ioctl(vsync_fb_fd, FBIO_WAITFORVSYNC, &arg) < 0) return 0;
+	}
+	uint64_t avg = (vsync_now_ns() - t0) / 5;
+	LOG_info("[VSYNC] FBIO_WAITFORVSYNC average %llu ns\n", (unsigned long long)avg);
+	// a stubbed ioctl returns immediately instead of blocking for a frame
+	return avg > (uint64_t)vsync_ctx.interval_ns * 85 / 100 && avg < (uint64_t)vsync_ctx.interval_ns * 115 / 100;
+}
+
+static int probeIrqVsync(void) {
+	if (vsync_sys_fd < 0) return 0;
+	uint32_t before = read_vsync_irq();
+	usleep(50000);
+	return read_vsync_irq() > before;
+}
+
+static void selectVsyncMode(void) {
+	if (vsync_sys_fd < 0) vsync_sys_fd = open("/sys/class/disp/disp/attr/sys", O_RDONLY);
+	if (vsync_fb_fd < 0) vsync_fb_fd = open("/dev/fb0", O_RDWR);
+
+	int fbio_ok = probeFbioVsync();
+	int irq_ok = probeIrqVsync();
+	int requested = readVsyncModeOverride();
+
+	if (requested == VSYNC_WAIT_SOFT) vsync_wait_mode = VSYNC_WAIT_SOFT;
+	else if (requested == VSYNC_WAIT_IRQ && irq_ok) vsync_wait_mode = VSYNC_WAIT_IRQ;
+	else if (fbio_ok) vsync_wait_mode = VSYNC_WAIT_FBIO;
+	else if (irq_ok) vsync_wait_mode = VSYNC_WAIT_IRQ;
+	else vsync_wait_mode = VSYNC_WAIT_SOFT;
+
+	vsync_last_ns = 0;
+	LOG_info("[VSYNC] fbio:%i irq:%i requested:%i -> mode %s\n", fbio_ok, irq_ok, requested, vsync_wait_names[vsync_wait_mode]);
+}
+
+void waitVsync(void) {
+	if (vsync_wait_mode == VSYNC_WAIT_FBIO) {
+		int arg = 0;
+		if (ioctl(vsync_fb_fd, FBIO_WAITFORVSYNC, &arg) == 0) return;
+		vsync_wait_mode = probeIrqVsync() ? VSYNC_WAIT_IRQ : VSYNC_WAIT_SOFT;
+		LOG_info("[VSYNC] FBIO wait failed, falling back to %s\n", vsync_wait_names[vsync_wait_mode]);
+	}
+	if (vsync_wait_mode == VSYNC_WAIT_IRQ) waitVsyncIrq();
+	else waitVsyncSoft();
+}
 
 void trigger_audio_server_route(int hdmi_on) {
     FILE *pid_file = popen("pidof audioserver.elf", "r");
@@ -911,6 +1032,7 @@ SDL_Surface* PLAT_initVideo(void) {
 	vid.vsync_refresh = 16666700; //virtual 60Hz
 	if (is_minarch!=0){
 		vid.vsync_refresh=measureAverageVsyncNs(); //calibration of virtual vsync after hdmi/lcd out selected
+		selectVsyncMode();
 	}
 	DEVICE_WIDTH = w;
 	DEVICE_HEIGHT = h;
@@ -980,12 +1102,10 @@ void PLAT_quitVideo(void) {
     if (screengame_16) SDL_FreeSurface(screengame_16);
     if (screengame_32) SDL_FreeSurface(screengame_32);
 	clean_layer();
-	munmap(vid.fbmmap[0], 0);
-	munmap(vid.fbmmap[1], 0);
+	for (int i = 0; i < vid.numpages; i++) munmap(vid.fbmmap[i], vid.screen_size);
 	free(vid.config_w);
 	close(vid.dispfd);	
-	close(vid.ion_fds[0]);
-	close(vid.ion_fds[1]);
+	for (int i = 0; i < vid.numpages; i++) close(vid.ion_fds[i]);
     close(vid.ionfd);
 }
 
@@ -1001,8 +1121,7 @@ void PLAT_clearAll(void) {
 	SDL_FillRect(vid.screen2, NULL, 0);
 	SDL_FillRect(screengame_16, NULL, 0);	
 	SDL_FillRect(screengame_32, NULL, 0);	
-	memset(vid.fbmmap[0], 0, vid.screen_size);
-	memset(vid.fbmmap[1], 0, vid.screen_size);
+	for (int i = 0; i < vid.numpages; i++) memset(vid.fbmmap[i], 0, vid.screen_size);
 }
 
 void PLAT_setVsync(int vsync) {
@@ -1063,7 +1182,7 @@ void PLAT_blitRenderer(GFX_Renderer* renderer) {
 		if (GFX_getRealScaler() == SCALER_NEAREST) {
 			scale_mat_nearest_lut_rgb565_neon_fast_xy_pitch(renderer->src_surface->pixels, renderer->src_surface->w, renderer->src_surface->h, renderer->src_surface->pitch, vid.screengame->pixels, vid.screengame->w, vid.screengame->h, vid.screengame->pitch, renderer->dst_x, renderer->dst_y,renderer->dst_w, renderer->dst_h);
 		} else {
-			vid.page ^= !show_debug;
+			if (!show_debug) vid.page = (vid.page + 1) % vid.numpages;
 			uint32_t * target = vid.fbmmap[vid.page];
 			quick = 1;
 			if (show_debug) {
@@ -1137,7 +1256,7 @@ void *memset32(void *m, uint32_t val, size_t count)
 }
 
 void PLAT_flip(SDL_Surface* IGNORED, int sync) { //this rotates minarch menu + minui + tools
-	vid.page ^= !quick;
+	if (!quick) vid.page = (vid.page + 1) % vid.numpages;
 	
 	if (!vid.renderingGame) {
 		vid.targetRect.x = 0;

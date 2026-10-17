@@ -988,7 +988,7 @@ void SND_selectResampler(void) {
 	double base_step = (double)snd.sample_rate_in / (double)out_rate;
 
 	double nominal_core_fps = (snd.frame_rate > 5.0 && snd.frame_rate <= 125.0) ? snd.frame_rate : 60.0;
-	if (snd.sample_rate_in <= 48000 && nominal_core_fps > 58.0 && fabs(screen_fps - nominal_core_fps) > 0.05) {
+	if (nominal_core_fps > 58.0 && fabs(screen_fps - nominal_core_fps) > 0.05) {
 		fixed_sample_step = base_step * (screen_fps / nominal_core_fps);
 	} else {
 		fixed_sample_step = base_step; /* mGBA a 65kHz ora usa il passo nativo e continuo privo di soffio */
@@ -1172,7 +1172,7 @@ void SND_init(double sample_rate, double frame_rate) { // plat_sound_init
 		 * senza lasciarci ingannare dal refresh rate fisico del monitor a 60Hz.
 		 */
 		if (frame_rate >= 55.0 || frame_rate <= 0.0) {
-			if (real_hardware_fps >= 59.8 && real_hardware_fps <= 60.2) {
+			if (real_hardware_fps >= 58.5 && real_hardware_fps <= 61.5) {
 				screen_fps = real_hardware_fps;
 			} else {
 				screen_fps = 60.0;
