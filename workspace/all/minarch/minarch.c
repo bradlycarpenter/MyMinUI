@@ -997,6 +997,15 @@ typedef struct OptionList {
 	// OptionList_callback_t on_set;
 } OptionList;
 
+static char* rumble_labels[] = {
+	"Off",
+	"25%",
+	"50%",
+	"75%",
+	"100%",
+	NULL
+};
+extern int rumble_scale_pct;
 static char* onoff_labels[] = {
 	"Off",
 	"On",
@@ -1072,6 +1081,7 @@ enum {
 	FE_OPT_DEBUG,
 	FE_OPT_MAXFF,
 	FE_OPT_PLAYAS,
+	FE_OPT_RUMBLE,
 	FE_OPT_COUNT,
 };
 
@@ -1341,6 +1351,16 @@ static struct Config {
 				.values = play_as_player_labels,
 				.labels = play_as_player_labels
 			},
+			[FE_OPT_RUMBLE] = {
+				.key	= "minarch_rumble_strength",
+				.name	= "Rumble Strength",
+				.desc	= "Scales the vibration strength\nrequested by the game.",
+				.default_value = 2,
+				.value = 2,
+				.count = 5,
+				.values = rumble_labels,
+				.labels = rumble_labels,
+			},
 			[FE_OPT_COUNT] = {NULL}
 		}
 	},
@@ -1464,6 +1484,10 @@ static void Config_syncFrontend(char* key, int value) {
 	else if (exactMatch(key,config.frontend.options[FE_OPT_MAXFF].key)) {
 		max_ff_speed = value;
 		i = FE_OPT_MAXFF;
+	}
+	else if (exactMatch(key,config.frontend.options[FE_OPT_RUMBLE].key)) {
+		rumble_scale_pct = value * 25;
+		i = FE_OPT_RUMBLE;
 	}
 	else if (exactMatch(key,config.frontend.options[FE_OPT_PLAYAS].key)) {
 		playAsPlayer = value;

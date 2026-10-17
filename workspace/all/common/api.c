@@ -1708,29 +1708,23 @@ static struct VIB_Context {
 } vib = {0};
 static void* VIB_thread(void *arg) {
 #define DEFER_FRAMES 3
-	static int defer = 0;
+	// strong and weak are tracked separately: comparing both against one shared
+	// value made cores that set them differently flip-flop every frame
+	static int defer[2] = {0, 0};
+	static int applied[2] = {0, 0};
 	while(1) {
 		usleep(16667);
-		if (vib.queued_strength[0]!=vib.strength) {
-			if (defer<DEFER_FRAMES && vib.queued_strength[0]==0) { // minimize vacillation between 0 and some number (which this motor doesn't like)
-				defer += 1;
+		for (int effect = 0; effect < 2; effect++) {
+			int queued = vib.queued_strength[effect];
+			if (queued == applied[effect]) continue;
+			if (defer[effect]<DEFER_FRAMES && queued==0) { // minimize vacillation between 0 and some number (which this motor doesn't like)
+				defer[effect] += 1;
 				continue;
 			}
-			vib.strength = vib.queued_strength[0];
-			defer = 0;
-
-			PLAT_setRumble(vib.effect,vib.strength);
-			continue;
-		}
-		if (vib.queued_strength[1]!=vib.strength) {
-			if (defer<DEFER_FRAMES && vib.queued_strength[1]==0) { // minimize vacillation between 0 and some number (which this motor doesn't like)
-				defer += 1;
-				continue;
-			}
-			vib.strength = vib.queued_strength[1];
-			defer = 0;
-
-			PLAT_setRumble(vib.effect,vib.strength);
+			applied[effect] = queued;
+			defer[effect] = 0;
+			vib.strength = applied[0] > applied[1] ? applied[0] : applied[1];
+			PLAT_setRumble(effect, queued);
 		}
 	}
 	return 0;

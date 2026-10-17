@@ -164,6 +164,16 @@ struct ff_effect {
 #define FF_RUMBLE	0x50
 #define EVIOCGBIT(ev,len)	_IOC(_IOC_READ, 'E', 0x20 + (ev), len)	/* get event bits */
 #define EVIOCSFF	_IOC(_IOC_WRITE, 'E', 0x80, sizeof(struct ff_effect))	/* send a force effect to a force feedback device */
+struct input_absinfo {
+	int32_t value;
+	int32_t minimum;
+	int32_t maximum;
+	int32_t fuzz;
+	int32_t flat;
+	int32_t resolution;
+};
+#define EVIOCRMFF	_IOW('E', 0x81, int)
+#define EVIOCGABS(abs)	_IOR('E', 0x40 + (abs), struct input_absinfo)
 
 #define NOMENU_PATH SYSTEM_PATH "/menumissing.txt"
 int menumissing = 0;
@@ -190,6 +200,7 @@ int testBit(int bit, const uint8_t arr[]) {
     return arr[bit / 8] & (1 << (bit % 8));
 }
 int rumblefd = -1;
+static int input_debug_remaining = -1;
 int check_rumble(char *rumbledevice){
 	char eventrumble[30];
 	if (exists(rumbledevice)) {
@@ -211,6 +222,44 @@ int check_rumble(char *rumbledevice){
 }
 
 
+// the raw ADC range is nominally 0..4096 but sticks rest off-centre (seen on the
+// RG40XXV), which a fixed 0..4096 -> +-0x7fff map turns into a held direction
+struct StickAxis {
+	int min, center, max;
+};
+static struct StickAxis stick_axes[6];
+#define STICK_DEADZONE_PCT 6
+
+static void calibrateSticks(int fd) {
+	for (int code = 2; code <= 5; code++) {
+		struct StickAxis* axis = &stick_axes[code];
+		struct input_absinfo info;
+		axis->min = 0;
+		axis->max = 4096;
+		axis->center = 2048;
+		if (fd >= 0 && ioctl(fd, EVIOCGABS(code), &info) == 0) {
+			if (info.maximum > info.minimum) {
+				axis->min = info.minimum;
+				axis->max = info.maximum;
+			}
+			if (info.value > axis->min && info.value < axis->max) axis->center = info.value;
+			else axis->center = (axis->min + axis->max) / 2;
+			LOG_info("[STICK] axis %d min:%d max:%d rest:%d flat:%d -> center %d\n", code, info.minimum, info.maximum, info.value, info.flat, axis->center);
+		}
+	}
+}
+
+static int stickValue(int code, int value, int invert) {
+	struct StickAxis* axis = &stick_axes[code];
+	int span = value < axis->center ? axis->center - axis->min : axis->max - axis->center;
+	if (span <= 0) return 0;
+	long out = (long)(value - axis->center) * 0x7fff / span;
+	if (out > 0x7fff) out = 0x7fff;
+	if (out < -0x7fff) out = -0x7fff;
+	if (labs(out) < 0x7fff * STICK_DEADZONE_PCT / 100) out = 0;
+	return invert ? -out : out;
+}
+
 void PLAT_initInput(void) {
 	LOG_info("PLAT_initInput start\n");fflush(stdout);
 	if (exists(NOMENU_PATH)) {
@@ -221,6 +270,7 @@ void PLAT_initInput(void) {
 	inputs[0] = open("/dev/input/event0", O_RDONLY | O_NONBLOCK | O_CLOEXEC); // power
 	inputs[1] = open("/dev/input/event1", O_RDONLY | O_NONBLOCK | O_CLOEXEC); // controller + volume
 	LOG_info("Init Input:Detected RG35XXSP\n");fflush(stdout);
+	calibrateSticks(inputs[1]);
 }
 
 void PLAT_quitInput(void) {
@@ -274,6 +324,7 @@ int PLAT_lidChanged(int* state) {
 static int prev_button_pressed_vert, prev_button_pressed_horiz;
 
 void PLAT_pollInput(void) {
+	if (input_debug_remaining < 0) input_debug_remaining = exists(SHARED_USERDATA_PATH "/input-debug") ? 1500 : 0;
 
 	// reset transient state
 	pad.just_pressed = BTN_NONE;
@@ -304,6 +355,11 @@ void PLAT_pollInput(void) {
 			int code = event.code;
 			int value = event.value;
 		//	LOG_info("/dev/input/event%d: Type %d event: SCANCODE/AXIS=%i, PRESSED/AXIS_VALUE=%i\n", i,type, code, value);system("sync");
+			if (input_debug_remaining > 0 && (type == EV_KEY || (type == EV_ABS && 1))) {
+				input_debug_remaining--;
+				LOG_info("[INPUT] event%d type:%d code:%d value:%d\n", i, type, code, value);
+				fflush(stdout);
+			}
 			// TODO: tmp, hardcoded, missing some buttons
 			if (type==EV_KEY) {
 				if (value>1) continue; // ignore repeats
@@ -364,12 +420,12 @@ void PLAT_pollInput(void) {
 					
 					btn = BTN_NONE; // already handled, force continue
 				}
-    			else if (code==RAW_LSX) { pad.laxis.x =  map(value ,0,4096,0x7fff,-0x7fff);
+    			else if (code==RAW_LSX) { pad.laxis.x =  stickValue(code, value, 0);
 					if (pad.map_leftstick_to_dpad)	PAD_setAnalog(BTN_ID_DPAD_LEFT, BTN_ID_DPAD_RIGHT, pad.laxis.x, tick+PAD_REPEAT_DELAY); } 
-				else if (code==RAW_LSY) { pad.laxis.y =  map(value ,0,4096,0x7fff,-0x7fff);
+				else if (code==RAW_LSY) { pad.laxis.y =  stickValue(code, value, 1);
 					if (pad.map_leftstick_to_dpad)	PAD_setAnalog(BTN_ID_DPAD_UP,   BTN_ID_DPAD_DOWN,  pad.laxis.y, tick+PAD_REPEAT_DELAY); }
-				else if (code==RAW_RSX) pad.raxis.x =  map(value ,0,4096,-0x7fff,0x7fff);
-				else if (code==RAW_RSY) pad.raxis.y =  map(value ,0,4096,0x7fff,-0x7fff);
+				else if (code==RAW_RSX) pad.raxis.x =  stickValue(code, value, 0);
+				else if (code==RAW_RSY) pad.raxis.y =  stickValue(code, value, 1);
 			}
 	
 			if (btn==BTN_NONE) continue;
@@ -1570,39 +1626,51 @@ enum retro_rumble_effect
    RETRO_RUMBLE_DUMMY = 10
 };
 
-static int rumblenum[2] = {-1,-1};
+static int rumble_id = -1;
+static int rumble_magnitude[2] = {0, 0};
+int rumble_scale_pct = 50;
+#define RUMBLE_FLOOR 0x4000
 void PLAT_setRumble(int effect, int strength) {
-	// buh
-	/* Create new or update old playing state. */
-    struct ff_effect e      = {0};
-	struct input_event play;
-    e.type   = FF_RUMBLE;
-    e.id     = rumblenum[effect];
-    e.replay.delay = 0;
-	e.replay.length = 0xc000; // 1 second    e.u.rumble.strong_magnitude = strength;
-	if (effect == RETRO_RUMBLE_STRONG) {
-		e.u.rumble.strong_magnitude = strength;
-	} else {
-		e.u.rumble.weak_magnitude = strength;
+	if (rumblefd < 0 || effect < 0 || effect > 1) return;
+	if (input_debug_remaining > 0) {
+		input_debug_remaining--;
+		LOG_info("[RUMBLE] effect:%d strength:%d scale:%d id:%d\n", effect, strength, rumble_scale_pct, rumble_id);
 	}
-
-//	LOG_info("Setting rumble %d effect %d with strength %d\n", rumblenum[effect], effect, strength);fflush(stdout);
-    //rumblenum++;
-	if (ioctl(rumblefd, EVIOCSFF, &e) < 0)
-	{
-	//	LOG_info("Failed to set rumble effect num %d\n", rumblenum);
-		return;
-	} else {
-		memset(&play,0,sizeof(play));
-		play.type = EV_FF;
-		play.code = e.id;
-		rumblenum[effect] = e.id;
-		play.value = 1;	
-		if (write(rumblefd, (const void*) &play, sizeof(play)) < sizeof(play)) {
-	//		LOG_info("Unable to Play rumble effect");fflush(stdout);
-			;
+	// small magnitudes barely move the motor, so scale between a floor and full
+	// power to keep the low Rumble Strength settings perceptible
+	int scaled = strength * rumble_scale_pct / 100;
+	rumble_magnitude[effect] = scaled ? RUMBLE_FLOOR + (long)scaled * (0xffff - RUMBLE_FLOOR) / 0xffff : 0;
+	struct input_event play = {0};
+	play.type = EV_FF;
+	if (!rumble_magnitude[0] && !rumble_magnitude[1]) {
+		// uploading a zero-magnitude effect leaves the motor running on this driver;
+		// the effect has to be stopped
+		if (rumble_id >= 0) {
+			play.code = rumble_id;
+			play.value = 0;
+			if (write(rumblefd, &play, sizeof(play)) < 0) LOG_info("[RUMBLE] stop failed errno:%d\n", errno);
+			// re-uploading a stopped effect by id sometimes gets EINVAL from this driver,
+			// dropping that rumble; erase it so the next start uploads a fresh effect
+			ioctl(rumblefd, EVIOCRMFF, rumble_id);
+			rumble_id = -1;
 		}
+		return;
 	}
+	struct ff_effect e = {0};
+	e.type = FF_RUMBLE;
+	e.id = rumble_id;
+	e.replay.length = 0xc000;
+	e.u.rumble.strong_magnitude = rumble_magnitude[0];
+	e.u.rumble.weak_magnitude = rumble_magnitude[1];
+	if (ioctl(rumblefd, EVIOCSFF, &e) < 0) {
+		LOG_info("[RUMBLE] upload failed id:%d strong:%d weak:%d errno:%d\n", e.id, rumble_magnitude[0], rumble_magnitude[1], errno);
+		rumble_id = -1;
+		return;
+	}
+	rumble_id = e.id;
+	play.code = e.id;
+	play.value = 1;
+	if (write(rumblefd, &play, sizeof(play)) < 0) LOG_info("[RUMBLE] play failed errno:%d\n", errno);
 }
 
 int PLAT_pickSampleRate(int requested, int max) {
