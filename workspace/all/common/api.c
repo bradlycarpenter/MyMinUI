@@ -1016,8 +1016,12 @@ static inline SND_Frame process_sinc_neon_aligned(int phase_idx) {
 	int32_t final_r = vgetq_lane_s32(v_sum_r, 0) + vgetq_lane_s32(v_sum_r, 1) + vgetq_lane_s32(v_sum_r, 2) + vgetq_lane_s32(v_sum_r, 3);
 
 	/* Convergent rounding shift pass filters out high-frequency quantization edge steps */
-	out.left  = (int16_t)((final_l + 8192) >> 14);
-	out.right = (int16_t)((final_r + 8192) >> 14);
+	// sinc interpolation overshoots near full scale; wrapping instead of clamping
+	// turns loud passages into crackle
+	int32_t l = (final_l + 8192) >> 14;
+	int32_t r = (final_r + 8192) >> 14;
+	out.left  = (int16_t)(l > 32767 ? 32767 : (l < -32768 ? -32768 : l));
+	out.right = (int16_t)(r > 32767 ? 32767 : (r < -32768 ? -32768 : r));
 	return out;
 }
 

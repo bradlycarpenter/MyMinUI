@@ -1628,49 +1628,84 @@ enum retro_rumble_effect
 
 static int rumble_id = -1;
 static int rumble_magnitude[2] = {0, 0};
+static volatile int rumble_duty = 0; // 0..100
 int rumble_scale_pct = 50;
-#define RUMBLE_FLOOR 0x4000
-void PLAT_setRumble(int effect, int strength) {
-	if (rumblefd < 0 || effect < 0 || effect > 1) return;
-	if (input_debug_remaining > 0) {
-		input_debug_remaining--;
-		LOG_info("[RUMBLE] effect:%d strength:%d scale:%d id:%d\n", effect, strength, rumble_scale_pct, rumble_id);
-	}
-	// small magnitudes barely move the motor, so scale between a floor and full
-	// power to keep the low Rumble Strength settings perceptible
-	int scaled = strength * rumble_scale_pct / 100;
-	rumble_magnitude[effect] = scaled ? RUMBLE_FLOOR + (long)scaled * (0xffff - RUMBLE_FLOOR) / 0xffff : 0;
+
+static void rumbleMotor(int on) {
+	static int motor_on = 0;
+	if (on == motor_on) return;
 	struct input_event play = {0};
 	play.type = EV_FF;
-	if (!rumble_magnitude[0] && !rumble_magnitude[1]) {
-		// uploading a zero-magnitude effect leaves the motor running on this driver;
-		// the effect has to be stopped
-		if (rumble_id >= 0) {
-			play.code = rumble_id;
-			play.value = 0;
-			if (write(rumblefd, &play, sizeof(play)) < 0) LOG_info("[RUMBLE] stop failed errno:%d\n", errno);
-			// re-uploading a stopped effect by id sometimes gets EINVAL from this driver,
-			// dropping that rumble; erase it so the next start uploads a fresh effect
-			ioctl(rumblefd, EVIOCRMFF, rumble_id);
-			rumble_id = -1;
+	if (on && rumble_id < 0) {
+		struct ff_effect e = {0};
+		e.type = FF_RUMBLE;
+		e.id = -1;
+		e.replay.length = 0xc000;
+		e.u.rumble.strong_magnitude = 0xffff;
+		e.u.rumble.weak_magnitude = 0xffff;
+		if (ioctl(rumblefd, EVIOCSFF, &e) < 0) {
+			LOG_info("[RUMBLE] upload failed errno:%d\n", errno);
+			return;
 		}
-		return;
+		rumble_id = e.id;
 	}
-	struct ff_effect e = {0};
-	e.type = FF_RUMBLE;
-	e.id = rumble_id;
-	e.replay.length = 0xc000;
-	e.u.rumble.strong_magnitude = rumble_magnitude[0];
-	e.u.rumble.weak_magnitude = rumble_magnitude[1];
-	if (ioctl(rumblefd, EVIOCSFF, &e) < 0) {
-		LOG_info("[RUMBLE] upload failed id:%d strong:%d weak:%d errno:%d\n", e.id, rumble_magnitude[0], rumble_magnitude[1], errno);
+	if (rumble_id < 0) return;
+	play.code = rumble_id;
+	play.value = on;
+	if (write(rumblefd, &play, sizeof(play)) < 0) {
+		LOG_info("[RUMBLE] %s failed errno:%d\n", on ? "play" : "stop", errno);
+		// a rejected effect id gets re-uploaded on the next start
+		ioctl(rumblefd, EVIOCRMFF, rumble_id);
 		rumble_id = -1;
 		return;
 	}
-	rumble_id = e.id;
-	play.code = e.id;
-	play.value = 1;
-	if (write(rumblefd, &play, sizeof(play)) < 0) LOG_info("[RUMBLE] play failed errno:%d\n", errno);
+	motor_on = on;
+}
+
+// the RG40XXV motor driver is on/off and ignores magnitude, so strength is
+// produced by pulsing the motor; its inertia smooths the pulses into a level
+#define RUMBLE_PWM_PERIOD_US 25000
+#define RUMBLE_MIN_DUTY 25
+static void* rumblePWM(void* arg) {
+	while (1) {
+		int duty = rumble_duty;
+		if (duty <= 0) {
+			rumbleMotor(0);
+			usleep(RUMBLE_PWM_PERIOD_US);
+		}
+		else if (duty >= 100) {
+			rumbleMotor(1);
+			usleep(RUMBLE_PWM_PERIOD_US);
+		}
+		else {
+			int on_us = RUMBLE_PWM_PERIOD_US * duty / 100;
+			rumbleMotor(1);
+			usleep(on_us);
+			rumbleMotor(0);
+			usleep(RUMBLE_PWM_PERIOD_US - on_us);
+		}
+	}
+	return NULL;
+}
+
+void PLAT_setRumble(int effect, int strength) {
+	static int pwm_started = 0;
+	if (rumblefd < 0 || effect < 0 || effect > 1) return;
+	if (!pwm_started) {
+		pthread_t t;
+		if (pthread_create(&t, NULL, rumblePWM, NULL) == 0) pthread_detach(t);
+		pwm_started = 1;
+	}
+	rumble_magnitude[effect] = strength;
+	int level = rumble_magnitude[0] > rumble_magnitude[1] ? rumble_magnitude[0] : rumble_magnitude[1];
+	int duty = 0;
+	if (level && rumble_scale_pct) duty = RUMBLE_MIN_DUTY + (100 - RUMBLE_MIN_DUTY) * (level * (long)rumble_scale_pct / 100) / 0xffff;
+	if (duty > 100) duty = 100;
+	if (input_debug_remaining > 0) {
+		input_debug_remaining--;
+		LOG_info("[RUMBLE] effect:%d strength:%d scale:%d duty:%d\n", effect, strength, rumble_scale_pct, duty);
+	}
+	rumble_duty = duty;
 }
 
 int PLAT_pickSampleRate(int requested, int max) {
