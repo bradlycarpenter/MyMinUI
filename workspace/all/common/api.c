@@ -1065,9 +1065,10 @@ size_t SND_batchSamples(const SND_Frame* frames, size_t frame_count) {
 		target_latency_ms = 1440.0 / core_target_fps;
 	}
 
-	// the device pulls 512-sample (~10.7ms) chunks, so the queue must sit well above
-	// one chunk or the re-preroll below fires on every pull
-	if (snd.sample_rate_in > 48000 && target_latency_ms < 32.0) target_latency_ms = 32.0;
+	// SDL drains this queue in ~21ms chunks, so the level swings by a whole chunk
+	// between frames; below ~36ms a small rate drift lets a pull find it empty and
+	// the gap is heard as a hitch (measured on PCSX at 44.1kHz with the 24ms default)
+	if (target_latency_ms < 36.0) target_latency_ms = 36.0;
 
 	if (queue_pre_roll_complete && current_latency_ms < 6.0 && snd.sample_rate_in > 48000) {
 		snd_stat_prerolls++;
