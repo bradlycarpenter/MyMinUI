@@ -2171,6 +2171,7 @@ static void OptionList_setOptionValue(OptionList* list, const char* key, const c
 
 static void Menu_beforeSleep(void);
 static void Menu_afterSleep(void);
+static void PROF_flush(void);
 
 static void Menu_saveState(void);
 static void Menu_loadState(void);
@@ -4054,6 +4055,7 @@ void Menu_quit(void) {
 	SDL_FreeSurface(menu.overlay);
 }
 void Menu_beforeSleep(void) {
+	PROF_flush();
 	SRAM_write();
 	RTC_write();
 	State_autosave();
@@ -5223,7 +5225,6 @@ static int getAlias(char* path, char* alias) {
 	return 0;
 }
 
-static void PROF_flush(void);
 static void Menu_loop(void) {
 
 	LOG_info("Entering Menu render= %i - rendering= %i\n",render,rendering);fflush(stdout);
