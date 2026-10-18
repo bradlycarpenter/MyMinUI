@@ -54,3 +54,4 @@ toolchains/miyoomini-toolchain/.build
 toolchains/rg35xx-toolchain/.build
 toolchains/my282-toolchain/.build
 
+toolchains/h700-toolchain/.build
