@@ -1029,6 +1029,9 @@ double snd_stat_min_latency_ms = 1000.0;
 uint32_t snd_stat_prerolls = 0;
 uint32_t snd_stat_flushes = 0;
 uint32_t snd_stat_max_latency_ms = 0;
+volatile float snd_prof_latency_ms = 0;
+volatile uint32_t snd_prof_prerolls = 0;
+volatile uint32_t snd_prof_flushes = 0;
 
 size_t SND_batchSamples(const SND_Frame* frames, size_t frame_count) {
 	if (!frames || frame_count == 0) return 0;
@@ -1044,6 +1047,7 @@ size_t SND_batchSamples(const SND_Frame* frames, size_t frame_count) {
 	uint32_t queued_bytes = 4608; 
 #endif
 	double current_latency_ms = (double)queued_bytes / 192.0;
+	snd_prof_latency_ms = current_latency_ms;
 	if (queue_pre_roll_complete && current_latency_ms < snd_stat_min_latency_ms) snd_stat_min_latency_ms = current_latency_ms;
 	if (current_latency_ms > snd_stat_max_latency_ms) snd_stat_max_latency_ms = (uint32_t)current_latency_ms;
 
@@ -1067,6 +1071,7 @@ size_t SND_batchSamples(const SND_Frame* frames, size_t frame_count) {
 
 	if (queue_pre_roll_complete && current_latency_ms < 6.0 && snd.sample_rate_in > 48000) {
 		snd_stat_prerolls++;
+		snd_prof_prerolls++;
 		queue_pre_roll_complete = 0;
 #if defined (USE_SDL2)
 		SDL_PauseAudioDevice(audioDeviceID, 1);
@@ -1078,6 +1083,7 @@ size_t SND_batchSamples(const SND_Frame* frames, size_t frame_count) {
 		SDL_ClearQueuedAudio(audioDeviceID);
 #endif
 		snd_stat_flushes++;
+		snd_prof_flushes++;
 		current_latency_ms = 0.0;
 	}
 

@@ -25,6 +25,7 @@
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
+#include <dirent.h>
 
 #if defined(USE_SDL2)
 #include "SDL2_rotozoom.h"
@@ -50,6 +51,7 @@ static int should_run_flip = 0;
 // the flip thread is busy isn't lost; bb_in_use guards the single backbuffer, which
 // the core may only overwrite once the flip thread has blitted the previous frame
 static int frame_pending = 0;
+static volatile uint32_t prof_video_frames = 0;
 static volatile int bb_in_use = 0;
 static int flipThreadStarted = 0;
 static int coreThreadStarted = 0;
@@ -3524,6 +3526,7 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 	if (thread_video) {		
 		pthread_mutex_lock(&flip_mx);
 		fps2_ticks++;
+		prof_video_frames++;
 		frame_pending = 1;
 		bb_in_use = 1;
 		pthread_cond_signal(&flip_rq);
@@ -5220,12 +5223,14 @@ static int getAlias(char* path, char* alias) {
 	return 0;
 }
 
+static void PROF_flush(void);
 static void Menu_loop(void) {
 
 	LOG_info("Entering Menu render= %i - rendering= %i\n",render,rendering);fflush(stdout);
 	if (thread_video==1) {	
 		wait_For_Thread();
 	}
+	PROF_flush();
 	if (firstmenu) PLAT_clearAll();
 	firstmenu = 0;
 	// 1. Perform the rotation first
@@ -5754,6 +5759,326 @@ static void limitFF(void) {
 	}
 	last_time = now;
 }
+
+// Hitch profiler, enabled by SHARED_USERDATA_PATH/hitch-prof. Everything is kept in RAM
+// and only written to the card while the core is stopped (menu, close) so the
+// profiler's own I/O can't contend with disc reads from the same card.
+#define PROF_FLAG_PATH SHARED_USERDATA_PATH "/hitch-prof"
+#define PROF_DIR SDCARD_PATH "/Logs/hitch"
+#define PROF_MAX_RUNS (60 * 60 * 62)
+#define PROF_MAX_VSYNCS (60 * 60 * 62)
+#define PROF_SYS_BYTES (12 * 1024 * 1024)
+
+typedef struct {
+	uint32_t t_us;
+	uint32_t wall_us;
+	uint32_t cpu_us;
+	uint32_t vsync;
+	uint32_t buttons;
+	uint16_t pace_us;
+	uint16_t audio_q10;
+	uint8_t minflt, majflt, nivcsw, nvcsw;
+	uint8_t video_frames, prerolls, flushes, pad;
+} ProfRun;
+
+typedef struct {
+	uint32_t t_us;
+	uint32_t gap_us;
+	uint16_t blit_us, copy_us, commit_us, pad;
+} ProfVsync;
+
+extern volatile uint32_t PLAT_vsyncCounter;
+static int prof_enabled = 0;
+static uint64_t prof_t0_ns = 0;
+static ProfRun* prof_runs = NULL;
+static volatile uint32_t prof_run_count = 0;
+static uint32_t prof_run_written = 0;
+static ProfVsync* prof_vsyncs = NULL;
+static volatile uint32_t prof_vsync_count = 0;
+static uint32_t prof_vsync_written = 0;
+static char* prof_sys = NULL;
+static volatile size_t prof_sys_len = 0;
+static size_t prof_sys_written = 0;
+static char prof_stem[MAX_PATH];
+extern volatile float snd_prof_latency_ms;
+extern volatile uint32_t snd_prof_prerolls;
+extern volatile uint32_t snd_prof_flushes;
+
+static inline uint32_t profNowUs(void) {
+	return (uint32_t)((PLAT_nowNs() - prof_t0_ns) / 1000);
+}
+
+static inline uint64_t profThreadCpuNs(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static inline uint8_t profClamp8(long v) {
+	return v < 0 ? 0 : (v > 255 ? 255 : v);
+}
+
+static inline uint16_t profClamp16(uint64_t v) {
+	return v > 65535 ? 65535 : v;
+}
+
+static struct {
+	uint64_t wall0, cpu0, end_ns;
+	struct rusage ru0;
+	uint32_t video0, prerolls0, flushes0;
+} prof_cur;
+
+static void PROF_runBegin(void) {
+	if (!prof_enabled) return;
+	prof_cur.wall0 = PLAT_nowNs();
+	prof_cur.cpu0 = profThreadCpuNs();
+	getrusage(RUSAGE_THREAD, &prof_cur.ru0);
+	prof_cur.video0 = prof_video_frames;
+}
+
+static void PROF_runEnd(void) {
+	if (!prof_enabled || prof_run_count >= PROF_MAX_RUNS) return;
+	uint64_t wall1 = PLAT_nowNs();
+	uint64_t cpu1 = profThreadCpuNs();
+	struct rusage ru1;
+	getrusage(RUSAGE_THREAD, &ru1);
+	ProfRun* r = &prof_runs[prof_run_count];
+	r->t_us = (uint32_t)((prof_cur.wall0 - prof_t0_ns) / 1000);
+	r->wall_us = (uint32_t)((wall1 - prof_cur.wall0) / 1000);
+	r->cpu_us = (uint32_t)((cpu1 - prof_cur.cpu0) / 1000);
+	r->vsync = PLAT_vsyncCounter;
+	r->buttons = buttons;
+	r->pace_us = 0;
+	r->audio_q10 = profClamp16((uint64_t)(snd_prof_latency_ms * 10));
+	r->minflt = profClamp8(ru1.ru_minflt - prof_cur.ru0.ru_minflt);
+	r->majflt = profClamp8(ru1.ru_majflt - prof_cur.ru0.ru_majflt);
+	r->nivcsw = profClamp8(ru1.ru_nivcsw - prof_cur.ru0.ru_nivcsw);
+	r->nvcsw = profClamp8(ru1.ru_nvcsw - prof_cur.ru0.ru_nvcsw);
+	r->video_frames = profClamp8(prof_video_frames - prof_cur.video0);
+	r->prerolls = profClamp8(snd_prof_prerolls - prof_cur.prerolls0);
+	r->flushes = profClamp8(snd_prof_flushes - prof_cur.flushes0);
+	prof_cur.prerolls0 = snd_prof_prerolls;
+	prof_cur.flushes0 = snd_prof_flushes;
+	prof_cur.end_ns = wall1;
+}
+
+static void PROF_paceEnd(void) {
+	if (!prof_enabled || prof_run_count >= PROF_MAX_RUNS) return;
+	prof_runs[prof_run_count].pace_us = profClamp16((PLAT_nowNs() - prof_cur.end_ns) / 1000);
+	__sync_synchronize();
+	prof_run_count++;
+}
+
+// called by the h700 platform after each vsync wait, from the flip thread
+void PROF_vsync(uint64_t now_ns, uint64_t gap_ns, const uint64_t* stage_ns) {
+	if (!prof_enabled || prof_vsync_count >= PROF_MAX_VSYNCS) return;
+	ProfVsync* v = &prof_vsyncs[prof_vsync_count];
+	v->t_us = (uint32_t)((now_ns - prof_t0_ns) / 1000);
+	v->gap_us = (uint32_t)(gap_ns / 1000);
+	v->blit_us = profClamp16(stage_ns[3] / 1000);
+	v->copy_us = profClamp16(stage_ns[4] / 1000);
+	v->commit_us = profClamp16(stage_ns[5] / 1000);
+	v->pad = 0;
+	__sync_synchronize();
+	prof_vsync_count++;
+}
+
+static void profSysAppend(const char* fmt, ...) {
+	if (prof_sys_len + 512 >= PROF_SYS_BYTES) return;
+	va_list args;
+	va_start(args, fmt);
+	int n = vsnprintf(prof_sys + prof_sys_len, PROF_SYS_BYTES - prof_sys_len, fmt, args);
+	va_end(args);
+	if (n > 0 && prof_sys_len + n < PROF_SYS_BYTES) prof_sys_len += n;
+}
+
+static int profReadFile(const char* path, char* buf, size_t size) {
+	int fd = open(path, O_RDONLY);
+	if (fd < 0) return -1;
+	ssize_t n = read(fd, buf, size - 1);
+	close(fd);
+	if (n < 0) return -1;
+	buf[n] = '\0';
+	return (int)n;
+}
+
+// /proc/<pid>/stat: comm may contain spaces, so parse from the closing paren
+static int profParseStat(const char* buf, char* comm, size_t comm_size, unsigned long* ut, unsigned long* st, int* cpu) {
+	const char* open_paren = strchr(buf, '(');
+	const char* close_paren = strrchr(buf, ')');
+	if (!open_paren || !close_paren) return 0;
+	size_t len = close_paren - open_paren - 1;
+	if (len >= comm_size) len = comm_size - 1;
+	memcpy(comm, open_paren + 1, len);
+	comm[len] = '\0';
+	for (char* c = comm; *c; c++) if (*c == ' ') *c = '_';
+	const char* p = close_paren + 2;
+	int field = 3;
+	*ut = *st = 0;
+	*cpu = -1;
+	while (*p) {
+		if (field == 14) *ut = strtoul(p, NULL, 10);
+		else if (field == 15) *st = strtoul(p, NULL, 10);
+		else if (field == 39) { *cpu = atoi(p); break; }
+		while (*p && *p != ' ') p++;
+		while (*p == ' ') p++;
+		field++;
+	}
+	return 1;
+}
+
+static void profSampleThreads(void) {
+	char path[128], buf[1024], comm[32];
+	DIR* d = opendir("/proc/self/task");
+	if (!d) return;
+	struct dirent* e;
+	profSysAppend(" th");
+	while ((e = readdir(d))) {
+		if (e->d_name[0] == '.') continue;
+		snprintf(path, sizeof(path), "/proc/self/task/%s/stat", e->d_name);
+		unsigned long ut, st;
+		int cpu;
+		if (profReadFile(path, buf, sizeof(buf)) > 0 && profParseStat(buf, comm, sizeof(comm), &ut, &st, &cpu)) {
+			profSysAppend(" %s:%s:%lu:%lu:%d", e->d_name, comm, ut, st, cpu);
+		}
+	}
+	closedir(d);
+}
+
+static void profSampleProcesses(void) {
+	static unsigned long prev_ticks[32768];
+	char path[64], buf[1024], comm[32];
+	DIR* d = opendir("/proc");
+	if (!d) return;
+	struct dirent* e;
+	pid_t self = getpid();
+	profSysAppend("P %u", profNowUs());
+	while ((e = readdir(d))) {
+		int pid = atoi(e->d_name);
+		if (pid <= 0 || pid >= 32768 || pid == self) continue;
+		snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+		unsigned long ut, st;
+		int cpu;
+		if (profReadFile(path, buf, sizeof(buf)) <= 0 || !profParseStat(buf, comm, sizeof(comm), &ut, &st, &cpu)) continue;
+		unsigned long ticks = ut + st;
+		if (prev_ticks[pid] && ticks > prev_ticks[pid]) profSysAppend(" %d:%s:%lu", pid, comm, ticks - prev_ticks[pid]);
+		prev_ticks[pid] = ticks;
+	}
+	closedir(d);
+	profSysAppend("\n");
+}
+
+static void* profSampler(void* arg) {
+	setpriority(PRIO_PROCESS, syscall(SYS_gettid), 19);
+	static char buf[16384];
+	int zones = 0;
+	while (zones < 8) {
+		char path[96];
+		snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/temp", zones);
+		if (access(path, R_OK) != 0) break;
+		zones++;
+	}
+	if (profReadFile("/sys/devices/system/cpu/cpufreq/policy0/scaling_governor", buf, sizeof(buf)) > 0) profSysAppend("# governor %s", buf);
+	if (profReadFile("/sys/devices/system/cpu/cpufreq/policy0/scaling_available_frequencies", buf, sizeof(buf)) > 0) profSysAppend("# freqs %s", buf);
+	if (profReadFile("/proc/cpuinfo", buf, sizeof(buf)) > 0) profSysAppend("# cpus %d\n", get_nprocs());
+	int tick = 0;
+	while (!quit) {
+		profSysAppend("S %u run:%d", profNowUs(), should_run_core);
+		if (profReadFile("/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq", buf, sizeof(buf)) > 0) profSysAppend(" freq:%d", atoi(buf));
+		profSysAppend(" temp");
+		for (int z = 0; z < zones; z++) {
+			char path[96];
+			snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/temp", z);
+			profSysAppend(":%d", profReadFile(path, buf, sizeof(buf)) > 0 ? atoi(buf) : -1);
+		}
+		if (profReadFile("/proc/stat", buf, sizeof(buf)) > 0) {
+			char* line = buf;
+			while (line && !strncmp(line, "cpu", 3)) {
+				char* next = strchr(line, '\n');
+				if (next) *next++ = '\0';
+				if (line[3] != ' ') {
+					unsigned long v[7] = {0};
+					sscanf(line + 3, "%*d %lu %lu %lu %lu %lu %lu %lu", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6]);
+					profSysAppend(" c%c:%lu:%lu:%lu:%lu:%lu:%lu:%lu", line[3], v[0], v[1], v[2], v[3], v[4], v[5], v[6]);
+				}
+				line = next;
+			}
+			char* ctxt = strstr(line ? line : buf, "ctxt ");
+			if (ctxt) profSysAppend(" ctxt:%lu", strtoul(ctxt + 5, NULL, 10));
+		}
+		if (profReadFile("/proc/vmstat", buf, sizeof(buf)) > 0) {
+			const char* keys[] = {"pgpgin ", "pgmajfault ", "pgscan_kswapd", "pgsteal_kswapd", "pswpin ", NULL};
+			for (int k = 0; keys[k]; k++) {
+				char* p = strstr(buf, keys[k]);
+				if (!p) continue;
+				p = strchr(p, ' ');
+				profSysAppend(" %.*s:%lu", (int)strcspn(keys[k], " "), keys[k], p ? strtoul(p, NULL, 10) : 0);
+			}
+		}
+		if (profReadFile("/proc/meminfo", buf, sizeof(buf)) > 0) {
+			char* p = strstr(buf, "MemAvailable:");
+			if (p) profSysAppend(" memavail:%lu", strtoul(p + 13, NULL, 10));
+		}
+		profSampleThreads();
+		profSysAppend("\n");
+		if (tick++ % 8 == 0) profSampleProcesses();
+		usleep(250000);
+	}
+	return NULL;
+}
+
+static void profAppendFile(const char* suffix, const void* data, size_t bytes) {
+	if (!bytes) return;
+	char path[MAX_PATH];
+	snprintf(path, sizeof(path), "%s%s", prof_stem, suffix);
+	FILE* f = fopen(path, "ab");
+	if (!f) return;
+	fwrite(data, 1, bytes, f);
+	fclose(f);
+}
+
+static void PROF_flush(void) {
+	if (!prof_enabled) return;
+	uint32_t runs = prof_run_count;
+	uint32_t vsyncs = prof_vsync_count;
+	size_t sys = prof_sys_len;
+	profAppendFile("-runs.bin", prof_runs + prof_run_written, (runs - prof_run_written) * sizeof(ProfRun));
+	profAppendFile("-vsync.bin", prof_vsyncs + prof_vsync_written, (vsyncs - prof_vsync_written) * sizeof(ProfVsync));
+	profAppendFile("-sys.txt", prof_sys + prof_sys_written, sys - prof_sys_written);
+	prof_run_written = runs;
+	prof_vsync_written = vsyncs;
+	prof_sys_written = sys;
+	sync();
+	LOG_info("[PROF] flushed runs:%u vsyncs:%u sys:%zuKB\n", runs, vsyncs, sys >> 10);
+}
+
+static void PROF_init(void) {
+	if (!exists(PROF_FLAG_PATH)) return;
+	prof_runs = calloc(PROF_MAX_RUNS, sizeof(ProfRun));
+	prof_vsyncs = calloc(PROF_MAX_VSYNCS, sizeof(ProfVsync));
+	prof_sys = malloc(PROF_SYS_BYTES);
+	if (!prof_runs || !prof_vsyncs || !prof_sys) {
+		LOG_info("[PROF] allocation failed\n");
+		return;
+	}
+	// fault the pages in now rather than from the core thread mid-game
+	memset(prof_runs, 0, PROF_MAX_RUNS * sizeof(ProfRun));
+	memset(prof_vsyncs, 0, PROF_MAX_VSYNCS * sizeof(ProfVsync));
+	mkdir(SDCARD_PATH "/Logs", 0755);
+	mkdir(PROF_DIR, 0755);
+	time_t now = time(NULL);
+	struct tm tm;
+	localtime_r(&now, &tm);
+	snprintf(prof_stem, sizeof(prof_stem), PROF_DIR "/%04d%02d%02d-%02d%02d%02d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+	prof_t0_ns = PLAT_nowNs();
+	profSysAppend("# game %s\n# core %s %s\n# screen_fps %.3f core_fps %.3f sample_rate %.0f\n# run_record %zu vsync_record %zu\n",
+		game.name, core.name, core.version, screen_fps, core.fps, core.sample_rate, sizeof(ProfRun), sizeof(ProfVsync));
+	prof_enabled = 1;
+	pthread_t t;
+	if (pthread_create(&t, NULL, profSampler, NULL) == 0) pthread_detach(t);
+	LOG_info("[PROF] recording to %s\n", prof_stem);
+}
+
 cpu_set_t coret;
 cpu_set_t flipt;
 
@@ -5837,8 +6162,11 @@ static void* coreThread(void *arg) {
 		pthread_mutex_unlock(&core_mx);
 		if (run) {
 			start_frame_time = MY_GetPerformanceCounter();
+			PROF_runBegin();
 			core.run();
+			PROF_runEnd();
 			limitFF();
+			PROF_paceEnd();
 			//trackFPS();
 		} else { //to keep cpu low while in the menu
 			sleep(0);
@@ -5993,6 +6321,7 @@ int main(int argc , char* argv[]) {
 	SND_init(core.sample_rate, core.fps);
 	InitSettings(); // after we initialize audio
 	Prewarm_start();
+	PROF_init();
 	Menu_init();
 	State_resume(resume_slot);
 	resume_slot=-1;
@@ -6126,6 +6455,7 @@ int main(int argc , char* argv[]) {
 	
 finish:
 
+	PROF_flush();
 	Game_close();
 	Core_unload();
 	Core_quit();

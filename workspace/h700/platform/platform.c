@@ -1066,6 +1066,7 @@ void PLAT_markVideoEntry(void) {
 }
 
 volatile uint32_t PLAT_vsyncCounter = 0;
+void PROF_vsync(uint64_t now_ns, uint64_t gap_ns, const uint64_t* stage_ns) __attribute__((weak));
 int PLAT_hasHardwareVsync(void) {
 	return vsync_wait_mode != VSYNC_WAIT_SOFT;
 }
@@ -1086,8 +1087,13 @@ void waitVsync(void) {
 		if (work > (uint64_t)vsync_ctx.interval_ns * 85 / 100) vsync_stat_near++;
 		vsync_stat_work_ns += work;
 	}
+	uint64_t prev = vsync_stat_prev_ns;
 	waitVsyncMode();
 	PLAT_vsyncCounter++;
+	if (PROF_vsync) {
+		uint64_t now = PLAT_nowNs();
+		PROF_vsync(now, prev ? now - prev : 0, frame_stage_ns);
+	}
 	vsyncStats();
 	memset(frame_stage_ns, 0, sizeof(frame_stage_ns));
 }
