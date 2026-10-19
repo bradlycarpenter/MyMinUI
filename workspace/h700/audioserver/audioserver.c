@@ -8,6 +8,7 @@
 #include <sys/types.h>
 #include <alsa/asoundlib.h>
 #include <signal.h>
+#include <sched.h>
 #include <time.h>
 #include <errno.h>
 
@@ -40,7 +41,9 @@ static void log_event(const char* kind, long a, long b) {
 #define BUFFER_SIZE 1024 
 
 #define SAMPLING_FREQ     48000
-#define LATENCY_TARGET_MS 20
+// must stay above the ~21ms chunks SDL writes into the FIFO, or one late chunk
+// drains the device; the ALSA buffer below leaves room on top of it
+#define LATENCY_TARGET_MS 32
 #define BUSY_THRESHOLD    ((SAMPLING_FREQ * LATENCY_TARGET_MS) / 1000) 
 
 // 🎯 STATE TRACKING VARIABLES
@@ -71,7 +74,7 @@ int configure_alsa_device(snd_pcm_t **handle, const char *dev_name) {
     }
     
     if (snd_pcm_set_params(*handle, SND_PCM_FORMAT_S16_LE, 
-                           SND_PCM_ACCESS_RW_INTERLEAVED, 2, SAMPLING_FREQ, 1, 40000) < 0) {
+                           SND_PCM_ACCESS_RW_INTERLEAVED, 2, SAMPLING_FREQ, 1, 64000) < 0) {
         fprintf(stderr, "[AUDIO SERVER ERROR] Hardware parameters initialization failed on %s\n", dev_name);
         snd_pcm_close(*handle);
         *handle = NULL;
@@ -86,6 +89,8 @@ int main(int argc, char *argv[]) {
     
     signal(SIGUSR1, handle_audio_route_signal);
     signal(SIGUSR2, handle_audio_route_signal);
+    struct sched_param param = {.sched_priority = 20};
+    if (sched_setscheduler(0, SCHED_FIFO, &param) < 0) perror("[AUDIO SERVER] SCHED_FIFO");
 
     // Initial state: Booting into Speaker mode (Card 0)
     if (configure_alsa_device(&alsa_handle, "default") < 0) {

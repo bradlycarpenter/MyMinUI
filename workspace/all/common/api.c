@@ -1187,6 +1187,33 @@ void SND_resizeBuffer(void) {
 	 */
 }
 
+#ifdef __linux__
+#include <dirent.h>
+#include <sched.h>
+// SDL's audio thread moves each chunk from the queue to the device and normally just
+// blocks; at normal priority a wakeup delayed by a few tens of ms empties the device
+// buffer, so give it a real-time slot like any desktop audio server would
+static void SND_promoteAudioThread(void) {
+	DIR* d = opendir("/proc/self/task");
+	if (!d) return;
+	struct dirent* e;
+	while ((e = readdir(d))) {
+		if (e->d_name[0] == '.') continue;
+		char path[64], comm[32] = {0};
+		snprintf(path, sizeof(path), "/proc/self/task/%s/comm", e->d_name);
+		FILE* f = fopen(path, "r");
+		if (!f) continue;
+		if (fgets(comm, sizeof(comm), f) && !strncmp(comm, "SDLAudio", 8)) {
+			struct sched_param param = {.sched_priority = 18};
+			int r = sched_setscheduler(atoi(e->d_name), SCHED_FIFO, &param);
+			LOG_info("[AUDIO] %s thread %s -> SCHED_FIFO %s\n", strtok(comm, "\n"), e->d_name, r == 0 ? "ok" : strerror(errno));
+		}
+		fclose(f);
+	}
+	closedir(d);
+}
+#endif
+
 void SND_init(double sample_rate, double frame_rate) { // plat_sound_init
 	frame_rate_bak = frame_rate;
 	sample_rate_bak = sample_rate;
@@ -1236,6 +1263,9 @@ void SND_init(double sample_rate, double frame_rate) { // plat_sound_init
 #if defined(USE_SDL2)
 	/* 🎯 Apriamo il dispositivo lasciandolo inizialmente in PAUSA nativa (parametro = 1) */
 	audioDeviceID = SDL_OpenAudioDevice(NULL, 0, &spec_in, &spec_out, 0);
+#ifdef __linux__
+	if (audioDeviceID > 0) SND_promoteAudioThread();
+#endif
 #define PLAT_PAUSE_AUDIO(state) SDL_PauseAudioDevice(audioDeviceID, state)
 #else
 	audioDeviceID = SDL_OpenAudio(&spec_in, &spec_out);
