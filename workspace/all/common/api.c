@@ -1030,6 +1030,8 @@ uint32_t snd_stat_prerolls = 0;
 uint32_t snd_stat_flushes = 0;
 uint32_t snd_stat_max_latency_ms = 0;
 volatile float snd_prof_latency_ms = 0;
+volatile float snd_prof_post_latency_ms = 0;
+volatile uint32_t snd_prof_frames_in = 0;
 volatile uint32_t snd_prof_prerolls = 0;
 volatile uint32_t snd_prof_flushes = 0;
 
@@ -1048,6 +1050,7 @@ size_t SND_batchSamples(const SND_Frame* frames, size_t frame_count) {
 #endif
 	double current_latency_ms = (double)queued_bytes / 192.0;
 	snd_prof_latency_ms = current_latency_ms;
+	snd_prof_frames_in += frame_count;
 	if (queue_pre_roll_complete && current_latency_ms < snd_stat_min_latency_ms) snd_stat_min_latency_ms = current_latency_ms;
 	if (current_latency_ms > snd_stat_max_latency_ms) snd_stat_max_latency_ms = (uint32_t)current_latency_ms;
 
@@ -1136,6 +1139,7 @@ size_t SND_batchSamples(const SND_Frame* frames, size_t frame_count) {
 	uint32_t post_queued_bytes = 4608;
 #endif
 	double post_latency_ms = (double)post_queued_bytes / 192.0;
+	snd_prof_post_latency_ms = post_latency_ms;
 
 	if (queue_pre_roll_complete) {
 		sched_yield();

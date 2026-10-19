@@ -8,6 +8,27 @@
 #include <sys/types.h>
 #include <alsa/asoundlib.h>
 #include <signal.h>
+#include <time.h>
+#include <errno.h>
+
+// timing events for minarch's Hitch Logging, which collects and truncates this file;
+// it lives on tmpfs and is only written when something goes wrong
+#define EVENT_LOG_PATH "/tmp/audioserver-events.log"
+#define EVENT_STARVE_US 15000
+#define EVENT_LOW_FRAMES (SAMPLING_FREQ * 5 / 1000)
+
+static uint64_t now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static void log_event(const char* kind, long a, long b) {
+    FILE* f = fopen(EVENT_LOG_PATH, "a");
+    if (!f) return;
+    fprintf(f, "%llu %s %ld %ld\n", (unsigned long long)now_ns(), kind, a, b);
+    fclose(f);
+}
 
 #define FIFO_PATH "/tmp/dsp"
 #ifndef F_SETPIPE_SZ
@@ -86,6 +107,8 @@ int main(int argc, char *argv[]) {
     }
     int pipe_size = fcntl(fifo_fd, F_SETPIPE_SZ, FIFO_SIZE);
     printf("[AUDIO SERVER] FIFO size: %d\n", pipe_size);
+    uint64_t last_read_ns = 0;
+    int low = 0;
 
     while (1) {
         // 🎯 THE FIX: Check route only if signaled AND the requested target differs from actual current state
@@ -120,16 +143,27 @@ int main(int argc, char *argv[]) {
         
         if (bytes_read > 0) {
             snd_pcm_uframes_t frames = bytes_read / 4; 
+            uint64_t t = now_ns();
+            if (last_read_ns && t - last_read_ns > EVENT_STARVE_US * 1000ULL) log_event("STARVE", (long)((t - last_read_ns) / 1000), (long)bytes_read);
+            last_read_ns = t;
             
             if (alsa_handle != NULL) {
                 snd_pcm_sframes_t written = snd_pcm_writei(alsa_handle, buffer, frames);
                 if (written < 0) {
+                    log_event("XRUN", (long)written, (long)frames);
                     snd_pcm_prepare(alsa_handle); 
+                    // the chunk that hit the underrun would otherwise be dropped
+                    snd_pcm_writei(alsa_handle, buffer, frames);
                 }
 
                 // MINUI BACKPRESSURE SYNC BLOCK
                 snd_pcm_sframes_t delay_frames;
                 if (snd_pcm_delay(alsa_handle, &delay_frames) == 0) {
+                    if (delay_frames < EVENT_LOW_FRAMES) {
+                        if (!low) log_event("LOW", (long)delay_frames, 0);
+                        low = 1;
+                    }
+                    else low = 0;
                     if (delay_frames > BUSY_THRESHOLD) {
                         snd_pcm_uframes_t extra_frames = delay_frames - BUSY_THRESHOLD;
                         useconds_t usleep_time = (uint64_t)extra_frames * 1000000 / SAMPLING_FREQ;

@@ -52,6 +52,10 @@ static int should_run_flip = 0;
 // the core may only overwrite once the flip thread has blitted the previous frame
 static int frame_pending = 0;
 static volatile uint32_t prof_video_frames = 0;
+static void PROF_setEnabled(int enable);
+// the saved Hitch Logging value is ignored until the menu has been opened, so a
+// saved "On" can't start a recording at launch
+static int prof_menu_seen = 0;
 static volatile int bb_in_use = 0;
 static int flipThreadStarted = 0;
 static int coreThreadStarted = 0;
@@ -1192,6 +1196,7 @@ enum {
 	FE_OPT_PLAYAS,
 	FE_OPT_RUMBLE,
 	FE_OPT_PREWARM,
+	FE_OPT_HITCHLOG,
 	FE_OPT_COUNT,
 };
 
@@ -1481,6 +1486,16 @@ static struct Config {
 				.values = onoff_labels,
 				.labels = onoff_labels,
 			},
+			[FE_OPT_HITCHLOG] = {
+				.key	= "minarch_hitch_log",
+				.name	= "Hitch Logging",
+				.desc	= "Record frame and audio timing to\nLogs/hitch on the card while On.\nTurn On before a race, Off after.",
+				.default_value = 0,
+				.value = 0,
+				.count = 2,
+				.values = onoff_labels,
+				.labels = onoff_labels,
+			},
 			[FE_OPT_COUNT] = {NULL}
 		}
 	},
@@ -1609,6 +1624,11 @@ static void Config_syncFrontend(char* key, int value) {
 		prewarm_enabled = value;
 		if (prewarm_enabled && game.is_open) Prewarm_start();
 		i = FE_OPT_PREWARM;
+	}
+	else if (exactMatch(key,config.frontend.options[FE_OPT_HITCHLOG].key)) {
+		if (!prof_menu_seen) value = 0;
+		PROF_setEnabled(value);
+		i = FE_OPT_HITCHLOG;
 	}
 	else if (exactMatch(key,config.frontend.options[FE_OPT_RUMBLE].key)) {
 		rumble_scale_pct = value * 25;
@@ -5232,6 +5252,7 @@ static void Menu_loop(void) {
 		wait_For_Thread();
 	}
 	PROF_flush();
+	prof_menu_seen = 1;
 	if (firstmenu) PLAT_clearAll();
 	firstmenu = 0;
 	// 1. Perform the rotation first
@@ -5761,11 +5782,11 @@ static void limitFF(void) {
 	last_time = now;
 }
 
-// Hitch profiler, enabled by SHARED_USERDATA_PATH/hitch-prof. Everything is kept in RAM
-// and only written to the card while the core is stopped (menu, close) so the
-// profiler's own I/O can't contend with disc reads from the same card.
-#define PROF_FLAG_PATH SHARED_USERDATA_PATH "/hitch-prof"
+// Hitch profiler, toggled from the menu (Hitch Logging). Each on/off span is a numbered
+// segment. Everything is kept in RAM and only written to the card while the core is
+// stopped (menu, sleep, close) so the profiler's own I/O can't contend with disc reads.
 #define PROF_DIR SDCARD_PATH "/Logs/hitch"
+#define PROF_AUDIOSERVER_LOG "/tmp/audioserver-events.log"
 #define PROF_MAX_RUNS (60 * 60 * 62)
 #define PROF_MAX_VSYNCS (60 * 60 * 62)
 #define PROF_SYS_BYTES (12 * 1024 * 1024)
@@ -5778,18 +5799,22 @@ typedef struct {
 	uint32_t buttons;
 	uint16_t pace_us;
 	uint16_t audio_q10;
+	uint16_t audio_post_q10;
+	uint16_t audio_frames_in;
 	uint8_t minflt, majflt, nivcsw, nvcsw;
-	uint8_t video_frames, prerolls, flushes, pad;
+	uint8_t video_frames, prerolls, flushes, segment;
 } ProfRun;
 
 typedef struct {
 	uint32_t t_us;
 	uint32_t gap_us;
-	uint16_t blit_us, copy_us, commit_us, pad;
+	uint16_t blit_us, copy_us, commit_us, segment;
 } ProfVsync;
 
 extern volatile uint32_t PLAT_vsyncCounter;
-static int prof_enabled = 0;
+static volatile int prof_enabled = 0;
+static int prof_allocated = 0;
+static uint8_t prof_segment = 0;
 static uint64_t prof_t0_ns = 0;
 static ProfRun* prof_runs = NULL;
 static volatile uint32_t prof_run_count = 0;
@@ -5802,6 +5827,8 @@ static volatile size_t prof_sys_len = 0;
 static size_t prof_sys_written = 0;
 static char prof_stem[MAX_PATH];
 extern volatile float snd_prof_latency_ms;
+extern volatile float snd_prof_post_latency_ms;
+extern volatile uint32_t snd_prof_frames_in;
 extern volatile uint32_t snd_prof_prerolls;
 extern volatile uint32_t snd_prof_flushes;
 
@@ -5824,21 +5851,26 @@ static inline uint16_t profClamp16(uint64_t v) {
 }
 
 static struct {
+	int active;
 	uint64_t wall0, cpu0, end_ns;
 	struct rusage ru0;
-	uint32_t video0, prerolls0, flushes0;
+	uint32_t video0, frames0, prerolls0, flushes0;
 } prof_cur;
 
 static void PROF_runBegin(void) {
-	if (!prof_enabled) return;
+	prof_cur.active = prof_enabled && prof_run_count < PROF_MAX_RUNS;
+	if (!prof_cur.active) return;
 	prof_cur.wall0 = PLAT_nowNs();
 	prof_cur.cpu0 = profThreadCpuNs();
 	getrusage(RUSAGE_THREAD, &prof_cur.ru0);
 	prof_cur.video0 = prof_video_frames;
+	prof_cur.frames0 = snd_prof_frames_in;
+	prof_cur.prerolls0 = snd_prof_prerolls;
+	prof_cur.flushes0 = snd_prof_flushes;
 }
 
 static void PROF_runEnd(void) {
-	if (!prof_enabled || prof_run_count >= PROF_MAX_RUNS) return;
+	if (!prof_cur.active) return;
 	uint64_t wall1 = PLAT_nowNs();
 	uint64_t cpu1 = profThreadCpuNs();
 	struct rusage ru1;
@@ -5851,6 +5883,8 @@ static void PROF_runEnd(void) {
 	r->buttons = buttons;
 	r->pace_us = 0;
 	r->audio_q10 = profClamp16((uint64_t)(snd_prof_latency_ms * 10));
+	r->audio_post_q10 = profClamp16((uint64_t)(snd_prof_post_latency_ms * 10));
+	r->audio_frames_in = profClamp16(snd_prof_frames_in - prof_cur.frames0);
 	r->minflt = profClamp8(ru1.ru_minflt - prof_cur.ru0.ru_minflt);
 	r->majflt = profClamp8(ru1.ru_majflt - prof_cur.ru0.ru_majflt);
 	r->nivcsw = profClamp8(ru1.ru_nivcsw - prof_cur.ru0.ru_nivcsw);
@@ -5858,13 +5892,13 @@ static void PROF_runEnd(void) {
 	r->video_frames = profClamp8(prof_video_frames - prof_cur.video0);
 	r->prerolls = profClamp8(snd_prof_prerolls - prof_cur.prerolls0);
 	r->flushes = profClamp8(snd_prof_flushes - prof_cur.flushes0);
-	prof_cur.prerolls0 = snd_prof_prerolls;
-	prof_cur.flushes0 = snd_prof_flushes;
+	r->segment = prof_segment;
 	prof_cur.end_ns = wall1;
 }
 
 static void PROF_paceEnd(void) {
-	if (!prof_enabled || prof_run_count >= PROF_MAX_RUNS) return;
+	if (!prof_cur.active) return;
+	prof_cur.active = 0;
 	prof_runs[prof_run_count].pace_us = profClamp16((PLAT_nowNs() - prof_cur.end_ns) / 1000);
 	__sync_synchronize();
 	prof_run_count++;
@@ -5879,7 +5913,7 @@ void PROF_vsync(uint64_t now_ns, uint64_t gap_ns, const uint64_t* stage_ns) {
 	v->blit_us = profClamp16(stage_ns[3] / 1000);
 	v->copy_us = profClamp16(stage_ns[4] / 1000);
 	v->commit_us = profClamp16(stage_ns[5] / 1000);
-	v->pad = 0;
+	v->segment = prof_segment;
 	__sync_synchronize();
 	prof_vsync_count++;
 }
@@ -5981,9 +6015,12 @@ static void* profSampler(void* arg) {
 	}
 	if (profReadFile("/sys/devices/system/cpu/cpufreq/policy0/scaling_governor", buf, sizeof(buf)) > 0) profSysAppend("# governor %s", buf);
 	if (profReadFile("/sys/devices/system/cpu/cpufreq/policy0/scaling_available_frequencies", buf, sizeof(buf)) > 0) profSysAppend("# freqs %s", buf);
-	if (profReadFile("/proc/cpuinfo", buf, sizeof(buf)) > 0) profSysAppend("# cpus %d\n", get_nprocs());
 	int tick = 0;
 	while (!quit) {
+		if (!prof_enabled) {
+			usleep(250000);
+			continue;
+		}
 		profSysAppend("S %u run:%d", profNowUs(), should_run_core);
 		if (profReadFile("/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq", buf, sizeof(buf)) > 0) profSysAppend(" freq:%d", atoi(buf));
 		profSysAppend(" temp");
@@ -6038,14 +6075,23 @@ static void profAppendFile(const char* suffix, const void* data, size_t bytes) {
 	fclose(f);
 }
 
+static void profCollectAudioserver(void) {
+	static char buf[256 * 1024];
+	int n = profReadFile(PROF_AUDIOSERVER_LOG, buf, sizeof(buf));
+	if (n <= 0) return;
+	truncate(PROF_AUDIOSERVER_LOG, 0);
+	profAppendFile("-aserver.txt", buf, n);
+}
+
 static void PROF_flush(void) {
-	if (!prof_enabled) return;
+	if (!prof_allocated) return;
 	uint32_t runs = prof_run_count;
 	uint32_t vsyncs = prof_vsync_count;
 	size_t sys = prof_sys_len;
 	profAppendFile("-runs.bin", prof_runs + prof_run_written, (runs - prof_run_written) * sizeof(ProfRun));
 	profAppendFile("-vsync.bin", prof_vsyncs + prof_vsync_written, (vsyncs - prof_vsync_written) * sizeof(ProfVsync));
 	profAppendFile("-sys.txt", prof_sys + prof_sys_written, sys - prof_sys_written);
+	profCollectAudioserver();
 	prof_run_written = runs;
 	prof_vsync_written = vsyncs;
 	prof_sys_written = sys;
@@ -6053,14 +6099,16 @@ static void PROF_flush(void) {
 	LOG_info("[PROF] flushed runs:%u vsyncs:%u sys:%zuKB\n", runs, vsyncs, sys >> 10);
 }
 
-static void PROF_init(void) {
-	if (!exists(PROF_FLAG_PATH)) return;
+static int profAllocate(void) {
 	prof_runs = calloc(PROF_MAX_RUNS, sizeof(ProfRun));
 	prof_vsyncs = calloc(PROF_MAX_VSYNCS, sizeof(ProfVsync));
 	prof_sys = malloc(PROF_SYS_BYTES);
 	if (!prof_runs || !prof_vsyncs || !prof_sys) {
 		LOG_info("[PROF] allocation failed\n");
-		return;
+		free(prof_runs);
+		free(prof_vsyncs);
+		free(prof_sys);
+		return 0;
 	}
 	// fault the pages in now rather than from the core thread mid-game
 	memset(prof_runs, 0, PROF_MAX_RUNS * sizeof(ProfRun));
@@ -6072,12 +6120,29 @@ static void PROF_init(void) {
 	localtime_r(&now, &tm);
 	snprintf(prof_stem, sizeof(prof_stem), PROF_DIR "/%04d%02d%02d-%02d%02d%02d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
 	prof_t0_ns = PLAT_nowNs();
-	profSysAppend("# game %s\n# core %s %s\n# screen_fps %.3f core_fps %.3f sample_rate %.0f\n# run_record %zu vsync_record %zu\n",
-		game.name, core.name, core.version, screen_fps, core.fps, core.sample_rate, sizeof(ProfRun), sizeof(ProfVsync));
-	prof_enabled = 1;
+	truncate(PROF_AUDIOSERVER_LOG, 0);
+	profSysAppend("# game %s\n# core %s %s\n# screen_fps %.3f core_fps %.3f sample_rate %.0f\n# run_record %zu vsync_record %zu\n# t0_monotonic_ns %llu\n",
+		game.name, core.name, core.version, screen_fps, core.fps, core.sample_rate, sizeof(ProfRun), sizeof(ProfVsync), (unsigned long long)prof_t0_ns);
+	prof_allocated = 1;
 	pthread_t t;
 	if (pthread_create(&t, NULL, profSampler, NULL) == 0) pthread_detach(t);
 	LOG_info("[PROF] recording to %s\n", prof_stem);
+	return 1;
+}
+
+static void PROF_setEnabled(int enable) {
+	if (enable == prof_enabled) return;
+	if (enable) {
+		if (!prof_allocated && !profAllocate()) return;
+		prof_segment++;
+		profSysAppend("# segment %u on %u\n", prof_segment, profNowUs());
+		prof_enabled = 1;
+	}
+	else {
+		prof_enabled = 0;
+		profSysAppend("# segment %u off %u\n", prof_segment, profNowUs());
+		PROF_flush();
+	}
 }
 
 cpu_set_t coret;
@@ -6322,7 +6387,6 @@ int main(int argc , char* argv[]) {
 	SND_init(core.sample_rate, core.fps);
 	InitSettings(); // after we initialize audio
 	Prewarm_start();
-	PROF_init();
 	Menu_init();
 	State_resume(resume_slot);
 	resume_slot=-1;
